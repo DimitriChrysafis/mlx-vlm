@@ -245,6 +245,7 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
+        self.num_experts = num_experts
 
     def __call__(
         self, x, indices, weights=None, shared=None, residual=None
@@ -302,12 +303,20 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        sorted_indices = do_sort
+        if (
+            hasattr(self.gate_proj, "mode")
+            and self.gate_proj.num_experts != self.num_experts
+        ):
+            # Expert partitioning must not lower GatherQMM's B/E >= 4
+            # threshold: NVFP4 vector and matrix kernels round differently.
+            sorted_indices = do_sort and indices.size >= 4 * self.num_experts
+        x_up = self.up_proj(x, idx, sorted_indices=sorted_indices)
+        x_gate = self.gate_proj(x, idx, sorted_indices=sorted_indices)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
-            sorted_indices=do_sort,
+            sorted_indices=sorted_indices,
         )
 
         if do_sort:

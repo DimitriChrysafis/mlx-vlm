@@ -60,8 +60,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--cache-limit",
+        type=int,
+        default=None,
+        help="MLX allocation cache limit in bytes; use 0 to release loading buffers.",
+    )
     args = parser.parse_args()
 
+    if args.cache_limit is not None:
+        mx.set_cache_limit(args.cache_limit)
     group = mx.distributed.init(strict=args.backend != "any", backend=args.backend)
     rank = group.rank()
     pipeline_group = group if args.pipeline else None
