@@ -75,6 +75,18 @@ For Python, call `mx.set_cache_limit(0)` before
 from `mx.distributed.init(...)`. Use the normal generation APIs on every rank.
 Expert buffers are materialized and partitioned one layer at a time to release
 the full allocations during loading; lazy slices alone retain those allocations.
+The sharding path also clears temporary allocations after each layer.
+
+The standard [cluster APIs](../../../docs/cluster-api.md) support this model.
+Configure matching source and MLX versions on each host, then use
+`POST /v1/cluster/models/prepare` to deliver the native checkpoint and
+`POST /v1/cluster/start` to launch and load a stopped group. For direct RDMA
+delivery, configure the selected peer's `ssh.rdma` link and request
+`transport: "jaccl_rdma"`. Send generation requests to `/v1/responses` with
+`distributed: true` and `reasoning_effort: "none"` for direct answers.
+Each destination needs room for the full checkpoint on disk even though each
+of two inference ranks keeps only half the experts in memory. Cluster member
+validation checks expert ownership; attention-head divisibility is not required.
 
 Validation on MLX 0.32.4 includes real ring collectives with two and four local
 ranks on tiny dense and mixed-quantization models, with exact BF16 logit agreement
@@ -87,9 +99,33 @@ for the red-image smoke test. Each rank stores 192 experts per layer and about
 
 The full-size local test serialized loading and warmup and used host barriers
 around inference steps because both processes shared one GPU. Concurrent loading
-on that GPU hit a Metal timeout. These are correctness results; multi-Mac
-JACCL/RDMA operation and throughput have not been measured. Exact agreement with
-single-device MLX does not remove the CPU-reference differences described below.
+on that GPU hit a Metal timeout. These are correctness results. Exact agreement
+with single-device MLX does not remove the CPU-reference differences described
+below.
+
+The cluster APIs were also tested on two physical 512 GB M3 Ultras connected
+through JACCL and a direct Thunderbolt RDMA link, using MLX
+`0.32.5.dev20261030+1ba7f96`. Verified delivery of the full 393.51 GB checkpoint
+took 71.9 seconds. Managed launch/load, text and image streaming, a 1,025-token
+input, retained decode continuation, concurrent request admission, and managed
+shutdown passed. Resumed text matched uninterrupted generation, and both
+concurrent requests matched their individual controls. Both workers remained
+healthy and reported matching inference fingerprints.
+
+Measured single-request results for the same 1,025-token input (temperature 0,
+no thinking, no draft, zero cached input tokens):
+
+| Prefill chunk | Prompt tokens/s | Generation tokens/s | Client time to first text | Output tokens | Peak GB/rank |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128 | 141.1 | 12.72 | 8.05 s | 32 | 209.1 |
+| 1,024 | 319.6 | 12.45 | 3.78 s | 28 | 209.1 |
+
+These are individual functional runs, not a repeated throughput benchmark.
+Changing the prefill chunk changed the greedy answer on this long prompt,
+consistent with the execution-shape sensitivity discussed below. The API tests
+check rank consistency and generated text; they do not establish full-logit
+parity with the CPU reference or rerun the retained single-device logit comparison
+under this newer MLX build.
 
 The dense parameters retain the checkpoint's mixed dtypes: 96 attention-residual
 queries and 48 router biases are FP32; the other 1,274 unquantized tensors are
