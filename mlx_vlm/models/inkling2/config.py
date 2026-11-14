@@ -49,6 +49,14 @@ class TextConfig(BaseModelConfig):
         return (index + 1) % 6 != 0
 
 
+def validate_sharding(config: dict, world_size: int):
+    """Cluster preflight: only the expert axis is partitioned."""
+    text = config.get("text_config") or config
+    count = text.get("n_routed_experts", TextConfig.n_routed_experts)
+    if not 1 <= world_size <= count:
+        raise ValueError("Each distributed rank must own at least one expert")
+
+
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str = "inkling2_vision"

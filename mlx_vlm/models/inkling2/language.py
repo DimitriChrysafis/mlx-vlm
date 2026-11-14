@@ -36,7 +36,7 @@ from ..inkling.language import (
     banded_additive_mask,
 )
 from ..switch_layers import SwitchGLU
-from .config import TextConfig
+from .config import TextConfig, validate_sharding
 
 
 def l2_clip(x, threshold, scale=None):
@@ -415,7 +415,8 @@ class LanguageModel(InklingLanguageModel):
         group = group or mx.distributed.init()
         size, rank = group.size(), group.rank()
         count = self.config.n_routed_experts
-        if not 1 <= size <= count or not 0 <= rank < size:
+        validate_sharding(vars(self.config), size)
+        if not 0 <= rank < size:
             raise ValueError("Each distributed rank must own at least one expert")
         if self.sharding_group is not None:
             raise ValueError("Inkling 2 is already sharded")
@@ -453,6 +454,7 @@ class LanguageModel(InklingLanguageModel):
             # Materialize one layer at a time and release the full expert
             # buffers; lazy slices alone retain the unpartitioned allocation.
             mx.eval(moe.switch_mlp.parameters())
+            mx.clear_cache()
             moe.expert_start, moe.expert_end = start, end
             moe.sharding_group = group
         self.sharding_group = group
