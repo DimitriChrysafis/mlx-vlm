@@ -595,13 +595,16 @@ and is re-raised. Without a callback, ordinary whole-model evaluation is unchang
 
 For the server's text/multimodal chat loader, poll authenticated `GET /health`
 while the first Chat Completions, Responses or Messages request loads the model.
-A token-count request to `/v1/responses/input_tokens` can also warm it up. Start
-without `--model` for this flow: startup preloading still finishes before the
-HTTP server accepts requests. The same snapshot is available under
+A token-count request to `/v1/responses/input_tokens` can also warm it up.
+With `--model`, startup preloading runs in the background, so HTTP can serve
+the same progress while the model loads. The same snapshot is available under
 `server.model_load_progress` in `/metrics`.
 
 ```json
 {
+  "model_ready": false,
+  "preload_in_progress": true,
+  "preload_failures": {},
   "model_load_progress": {
     "model": "/path/to/model",
     "adapter_path": null,
@@ -623,6 +626,23 @@ retry after loading finishes. This is a current snapshot, not an event history o
 loading-cancellation API. Separate image-generation/audio loaders are not covered.
 Distributed workers reuse these measurements and retain their `sharding` and
 `synchronizing` stages through the existing cluster progress API.
+
+During startup preloading, `/health` remains HTTP 200 for liveness, while
+`model_ready` stays false. Local inference and warmup requests return HTTP 503
+with `detail.code: "model_loading"` and `Retry-After: 1`; they do not start another
+loader. `/unload` and settings changes return HTTP 409 until preloading finishes.
+Clients can poll `/health` or `/metrics`, then send their normal inference request
+once `model_ready` is true. This flag describes the local text model; distributed
+readiness remains part of the cluster API.
+
+Configured preloads run sequentially. Failures are recorded in `preload_failures`
+by model kind, including the model path and error, and the HTTP server remains
+available. A failed text load leaves `model_ready: false`; a later inference or
+warmup request can retry loading or choose a different model. The failure record
+describes the startup attempt. Without `--model`, on-demand loading still works.
+Graceful shutdown waits for the current loader to finish, skips remaining
+preloads, and releases cached models. It does not interrupt an in-flight native
+load or download, so shutdown can wait for that operation.
 
 ### Live settings (`/v1/settings`)
 
