@@ -38,6 +38,7 @@ from ..switch_layers import SwitchGLU
 from .config import TextConfig, validate_sharding
 
 
+@mx.compile
 def l2_clip(x, threshold, scale=None):
     dtype = x.dtype
     x = x.astype(mx.float32)
@@ -45,6 +46,42 @@ def l2_clip(x, threshold, scale=None):
         x = x * scale.astype(mx.float32)
     norm = mx.sqrt(mx.sum(mx.square(x), axis=-1, keepdims=True))
     return (x * mx.minimum(threshold / (norm + 1e-6), 1.0)).astype(dtype)
+
+
+@mx.compile
+def _softcapped_swiglu(up, gate, gate_cap, up_cap):
+    dtype = gate.dtype
+    gate, up = gate.astype(mx.float32), up.astype(mx.float32)
+    return (
+        mx.tanh(gate / gate_cap)
+        * gate_cap
+        * mx.sigmoid(gate)
+        * mx.tanh(up / up_cap)
+        * up_cap
+    ).astype(dtype)
+
+
+@mx.compile
+def _route(x, weight, bias, top_k, route_scale):
+    scores = mx.sigmoid(x.astype(mx.float32) @ weight.astype(mx.float32).T)
+    indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
+    return indices, weights
+
+
+@mx.compile
+def _combine_routes(out, weights):
+    return (out.astype(mx.float32) * weights[..., None]).sum(axis=-2).astype(out.dtype)
+
+
+@mx.compile
+def _attention_residual(states, query, normalize_values):
+    states = states.astype(mx.float32)
+    keys = mx.fast.rms_norm(states, None, 1e-6)
+    scores = (keys @ query.reshape(-1, states.shape[-1]).T) * states.shape[-1] ** -0.5
+    weights = mx.softmax(scores, axis=-2).swapaxes(-1, -2)
+    return weights @ (keys if normalize_values else states)
 
 
 _conv_history_kernel = mx.fast.metal_kernel(
@@ -137,11 +174,28 @@ class ShortConvolution(InklingShortConvolution):
         # Keep the convolution, residual, and scaling in FP32. The checkpoint
         # stores BF16 taps, but rounding the convolution before adding the
         # residual changes both reference parity and prefill/decode consistency.
-        xf = x.astype(mx.float32)
-        inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         state = cache[self.conv_idx] if cache is not None else None
         if state is None:
             state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]))
+        if (
+            not self.training
+            and x.dtype == mx.bfloat16
+            and self.kernel_size == 4
+            and x.shape[0] <= 4
+            and x.shape[1] <= 8
+            and x.shape[-1] % 128 == 0
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            from .kernels import short_convolution
+
+            # Temporal selection promotes selected BF16 values into FP32 state.
+            # Invalid positions never enter that state. The convolution itself
+            # reads masked inputs directly, without materializing a concat.
+            _update_conv_cache(cache, self.conv_idx, state, x, mask)
+            return short_convolution(state, self.conv.weight, x, mask, self.kernel_size)
+        xf = x.astype(mx.float32)
+        inputs = xf if mask is None else mx.where(mask[..., None], xf, 0)
         context = mx.concatenate([state, inputs], axis=1)
         _update_conv_cache(cache, self.conv_idx, state, inputs, mask)
         out = mx.conv1d(
@@ -202,6 +256,8 @@ class Attention(nn.Module):
         )
         self.sliding = config.sliding_window_size if self.is_sliding else 0
         self.rel_extent = self.sliding or config.rel_extent
+        self.sharding_group = None
+        self.head_start = 0
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=False
         )
@@ -232,13 +288,99 @@ class Attention(nn.Module):
                 else DynamicShortConvolution(config, channels, self.n_kv, idx)
             )
 
+    def shard(self, group):
+        """Split complete heads and output rows without splitting dot products."""
+        if self.sharding_group is not None:
+            return
+        projections = ("q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "o_proj")
+        # Preserve the dense kernels' output-row tiles. Other configurations
+        # retain replicated attention while the experts are still partitioned.
+        if (
+            group.size() != 2
+            or self.n_heads % 2
+            or self.n_kv % 2
+            or not mx.metal.is_available()
+            or mx.default_device() != mx.gpu
+            or any(
+                type(self[name]) is not nn.Linear
+                or "bias" in self[name]
+                or self[name].weight.shape[0] % 256
+                for name in projections
+            )
+            or (
+                not self.is_sliding
+                and any(
+                    type(self[name].weight_proj) is not nn.Linear
+                    or "bias" in self[name].weight_proj
+                    for name in ("k_sconv", "v_sconv")
+                )
+            )
+        ):
+            return
+        rank = group.rank()
+        for name in projections:
+            projection = self[name]
+            width = projection.weight.shape[0] // 2
+            projection.weight = mx.contiguous(
+                projection.weight[rank * width : (rank + 1) * width]
+            )
+        for name in ("q_scale", "rel_scale"):
+            value = self[name]
+            width = value.shape[0] // 2
+            self[name] = mx.contiguous(value[rank * width : (rank + 1) * width])
+        for name in ("k_sconv", "v_sconv"):
+            conv = self[name]
+            if self.is_sliding:
+                width = conv.conv.weight.shape[0] // 2
+                conv.conv.weight = mx.contiguous(
+                    conv.conv.weight[rank * width : (rank + 1) * width]
+                )
+            else:
+                conv.num_heads //= 2
+                width = conv.static_weight.shape[1] // 2
+                conv.static_weight = mx.contiguous(
+                    conv.static_weight[:, rank * width : (rank + 1) * width]
+                )
+                width = conv.weight_proj.weight.shape[0] // 2
+                conv.weight_proj.weight = mx.contiguous(
+                    conv.weight_proj.weight[rank * width : (rank + 1) * width]
+                )
+        self.n_heads //= 2
+        self.n_kv //= 2
+        self.head_start = rank * self.n_heads
+        self.sharding_group = group
+
+    def _gather_features(self, x):
+        if self.sharding_group is None:
+            return x
+        shape = x.shape
+        return (
+            mx.distributed.all_gather(
+                x.reshape(1, -1, shape[-1]), group=self.sharding_group
+            )
+            .transpose(1, 0, 2)
+            .reshape(*shape[:-1], shape[-1] * self.sharding_group.size())
+        )
+
+    def _project(self, projection, x):
+        if self.sharding_group is None or x.size // x.shape[-1] <= 15:
+            return projection(x)
+        # Matrix kernels can change reduction order when N is halved. Preserve
+        # the original N with zero rows for the other rank, then select our
+        # complete rows. No remote weights are stored or used by this fallback.
+        width = projection.weight.shape[0]
+        start = self.sharding_group.rank() * width
+        weight = mx.pad(projection.weight, ((start, width - start), (0, 0)))
+        return (x @ weight.T)[..., start : start + width]
+
     def __call__(self, x, key_input=None, value_input=None, cache=None, conv_mask=None):
         b, length, _ = x.shape
         cfg = self.config
         kv, conv = cache if cache is not None else (None, None)
         key_input = x if key_input is None else key_input
         value_input = x if value_input is None else value_input
-        k, v = self.k_proj(key_input), self.v_proj(value_input)
+        k = self._project(self.k_proj, key_input)
+        v = self._project(self.v_proj, value_input)
         if self.is_sliding:
             k = self.k_sconv(k, conv, conv_mask)
             v = self.v_sconv(v, conv, conv_mask)
@@ -246,7 +388,9 @@ class Attention(nn.Module):
             k = self.k_sconv(k, key_input, conv, conv_mask)
             v = self.v_sconv(v, value_input, conv, conv_mask)
         q = l2_clip(
-            self.q_proj(x).reshape(b, length, self.n_heads, self.head_dim),
+            self._project(self.q_proj, x).reshape(
+                b, length, self.n_heads, self.head_dim
+            ),
             cfg.qk_l2_clip_threshold,
             self.q_scale,
         )
@@ -259,7 +403,7 @@ class Attention(nn.Module):
                 x.dtype
             )
         r = l2_clip(
-            self.r_proj(x).reshape(b, length, self.n_heads, cfg.d_rel),
+            self._project(self.r_proj, x).reshape(b, length, self.n_heads, cfg.d_rel),
             cfg.rel_l2_clip_threshold,
             self.rel_scale,
         )
@@ -293,7 +437,12 @@ class Attention(nn.Module):
             shape_ref=k,
         )
         # A query-dependent sink is represented by a zero K/V and its own logit.
-        sinks = self.sink_proj(x).transpose(0, 2, 1)[..., None]
+        # Keep this tiny projection's original width: splitting its 48 output
+        # rows changes the prefill GEMM reduction and hence BF16 rounding.
+        sinks = self.sink_proj(x)
+        if self.sharding_group is not None:
+            sinks = sinks[..., self.head_start : self.head_start + self.n_heads]
+        sinks = sinks.transpose(0, 2, 1)[..., None]
         mask = mx.concatenate([mask, sinks], axis=-1)
         k = mx.concatenate(
             [k, mx.zeros((b, self.n_kv, 1, self.head_dim), k.dtype)], axis=2
@@ -306,9 +455,14 @@ class Attention(nn.Module):
         )
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
         out = (
-            out.astype(mx.float32) * mx.sigmoid(self.gate_proj(x).astype(mx.float32))
+            out.astype(mx.float32)
+            * mx.sigmoid(self._project(self.gate_proj, x).astype(mx.float32))
         ).astype(x.dtype)
-        return self.o_proj(out)
+        # Every output dot still consumes all heads on one rank. Gather the
+        # heads first, project complete output rows, then restore hidden order.
+        return self._gather_features(
+            self._project(self.o_proj, self._gather_features(out))
+        )
 
 
 class SoftcappedSwiGLU(nn.Module):
@@ -318,15 +472,7 @@ class SoftcappedSwiGLU(nn.Module):
         self.up_cap = config.mlp_up_softcap
 
     def __call__(self, up, gate):
-        dtype = gate.dtype
-        gate, up = gate.astype(mx.float32), up.astype(mx.float32)
-        return (
-            mx.tanh(gate / self.gate_cap)
-            * self.gate_cap
-            * mx.sigmoid(gate)
-            * mx.tanh(up / self.up_cap)
-            * self.up_cap
-        ).astype(dtype)
+        return _softcapped_swiglu(up, gate, self.gate_cap, self.up_cap)
 
 
 class SparseMoE(nn.Module):
@@ -347,28 +493,31 @@ class SparseMoE(nn.Module):
         )
 
     def __call__(self, x):
-        scores = mx.sigmoid(
-            x.astype(mx.float32) @ self.gate_weight.astype(mx.float32).T
-        )
-        indices = mx.argpartition(
-            -(scores + self.e_score_correction_bias), self.top_k - 1, axis=-1
-        )[..., : self.top_k]
-        weights = mx.take_along_axis(scores, indices, axis=-1)
-        weights = (
-            weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * self.route_scale
+        indices, weights = _route(
+            x,
+            self.gate_weight,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.route_scale,
         )
         if self.sharding_group is None:
-            out = self.switch_mlp(x, indices)
+            if (
+                not self.training
+                and x.shape[0] <= 4
+                and 1 < x.shape[1] <= 8
+                and getattr(self.switch_mlp.down_proj, "mode", None) == "nvfp4"
+            ):
+                out = self.switch_mlp.masked(x, indices.astype(mx.int32))
+            else:
+                out = self.switch_mlp(x, indices)
         else:
             owned = (indices >= self.expert_start) & (indices < self.expert_end)
-            local = mx.where(owned, indices - self.expert_start, 0)
-            out = self.switch_mlp(x, local)
-            out = mx.where(owned[..., None], out, 0)
+            local = mx.where(owned, indices.astype(mx.int32) - self.expert_start, -1)
+            out = self.switch_mlp.masked(x, local)
             # Exactly one rank owns each route. Reduce route outputs before
             # weighting to retain the unsharded FP32 accumulation order.
             out = mx.distributed.all_sum(out, group=self.sharding_group)
-        out = out.astype(mx.float32)
-        return (out * weights[..., None]).sum(axis=-2).astype(x.dtype)
+        return _combine_routes(out, weights)
 
 
 class AttentionResidual(nn.Module):
@@ -382,13 +531,9 @@ class AttentionResidual(nn.Module):
         self.normalize_values = config.attn_res_normalize_values
 
     def __call__(self, blocks, partial):
-        states = mx.stack([*blocks, partial], axis=-2).astype(mx.float32)
-        keys = mx.fast.rms_norm(states, None, 1e-6)
-        scores = (keys @ self.query.reshape(-1, states.shape[-1]).T) * states.shape[
-            -1
-        ] ** -0.5
-        weights = mx.softmax(scores, axis=-2).swapaxes(-1, -2)
-        return weights @ (keys if self.normalize_values else states)
+        return _attention_residual(
+            mx.stack([*blocks, partial], axis=-2), self.query, self.normalize_values
+        )
 
 
 class DecoderLayer(nn.Module):
@@ -622,6 +767,9 @@ class LanguageModel(InklingLanguageModel):
             mx.clear_cache()
             moe.expert_start, moe.expert_end = start, end
             moe.sharding_group = group
+            layer.self_attn.shard(group)
+            mx.eval(layer.self_attn.parameters())
+            mx.clear_cache()
         self.sharding_group = group
 
     def _logits_from_norm(self, h):
@@ -629,7 +777,43 @@ class LanguageModel(InklingLanguageModel):
         # fwd_output_dtype=float32. Promote the product before multiplication;
         # casting BF16 scores afterwards loses the accumulator's low bits.
         h = h.astype(self.model.embed_norm.weight.dtype).astype(mx.float32)
-        logits = self.lm_head(h)
+        if (
+            not self.training
+            and type(self.lm_head) is nn.Linear
+            and "bias" not in self.lm_head
+            and h.ndim == 3
+            and h.shape[0] * h.shape[1] <= 15
+            and mx.metal.is_available()
+            and mx.default_device() == mx.gpu
+        ):
+            # Retain the exact conversion instead of reading and promoting the
+            # entire vocabulary matrix again on every decode step. Whole output
+            # rows can be shared across the two expert ranks without splitting
+            # any dot product or changing its FP32 accumulation.
+            weight = self.lm_head.weight
+            group = self.sharding_group
+            partition = (
+                group is not None
+                and group.size() == 2
+                and weight.shape[0] % group.size() == 0
+            )
+            size, rank = (group.size(), group.rank()) if partition else (1, 0)
+            cached = self.get("_head_projection_cache")
+            if cached is None or cached[0] is not weight or cached[1:3] != (size, rank):
+                width = weight.shape[0] // size
+                projected = weight[rank * width : (rank + 1) * width].astype(mx.float32)
+                self._head_projection_cache = (weight, size, rank, projected)
+            projected = self._head_projection_cache[-1]
+            logits = h @ projected.T
+            if partition:
+                width = projected.shape[0]
+                logits = (
+                    mx.distributed.all_gather(logits.reshape(1, -1, width), group=group)
+                    .transpose(1, 0, 2)
+                    .reshape(*h.shape[:-1], weight.shape[0])
+                )
+        else:
+            logits = self.lm_head(h)
         cap = self.config.final_logit_softcapping
         if cap:
             logits = mx.tanh(logits / cap) * cap

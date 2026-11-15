@@ -209,6 +209,91 @@ def test_inkling2_dspark_masked_convolution_history(width, length):
         equal(cache[0], expected, atol=0, rtol=0)
 
 
+@parametrize("batch", [1, 4])
+@parametrize("length", [1, 2, 3, 8])
+@parametrize("masked", [False, True])
+def test_inkling2_short_convolution_native_fp32_rounding(
+    batch, length, masked, monkeypatch
+):
+    from mlx_vlm.models.inkling2 import kernels
+    from mlx_vlm.models.inkling2.language import ShortConvolution
+
+    conv = ShortConvolution(128, 4, 0)
+    conv.set_dtype(mx.bfloat16)
+    conv.eval()
+    actual, reference = ArraysCache(4), ArraysCache(4)
+    state = mx.random.normal((batch, 3, 128))
+    actual[0] = reference[0] = state
+    x = mx.random.normal((batch, length, 128)).astype(mx.bfloat16)
+    mask = None
+    if masked:
+        positions = mx.arange(length)[None]
+        mask = (positions >= mx.array([0, 1, 0, length][:batch])[:, None]) & (
+            positions < mx.array([length, length, length - 1, length][:batch])[:, None]
+        )
+    actual.start_speculation(length)
+    reference.start_speculation(length)
+    calls = []
+    kernel = kernels.short_convolution
+
+    def record(*args):
+        calls.append(True)
+        return kernel(*args)
+
+    monkeypatch.setattr(kernels, "short_convolution", record)
+    output = conv(x, actual, mask)
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
+        assert calls
+    with monkeypatch.context() as patch:
+        patch.setattr(mx.metal, "is_available", lambda: False)
+        expected = conv(x, reference, mask)
+    retained = [length] if batch == 1 else [0, 1, length - 1, length]
+    actual.commit_speculation(retained)
+    reference.commit_speculation(retained)
+    equal(output, expected, atol=0, rtol=0)
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual[0].dtype == mx.float32
+
+
+@parametrize("rank", [None, 0, 1])
+def test_inkling2_fp32_head_cache_preserves_logits_and_reload(rank, monkeypatch):
+    target, _ = inkling2_dspark_case(mx.bfloat16)
+    lm = target.language_model
+    lm.lm_head = nn.Linear(32, 16384, bias=False)
+    lm.lm_head.set_dtype(mx.bfloat16)
+    lm.config.unpadded_vocab_size = 16370
+    if rank is not None:
+        lm.sharding_group = NS(size=lambda: 2, rank=lambda: rank)
+    h = mx.random.normal((4, 3, 32)).astype(mx.bfloat16)
+    for _ in range(2):
+        # Replacing checkpoint weights must invalidate the retained conversion.
+        lm.lm_head.weight = mx.random.normal((16384, 32)).astype(mx.bfloat16)
+        expected = h.astype(mx.float32) @ lm.lm_head.weight.astype(mx.float32).T
+
+        def gather(local, group):
+            parts = [
+                part.reshape(1, -1, 8192) for part in mx.split(expected, 2, axis=-1)
+            ]
+            equal(local, parts[rank], atol=0, rtol=0)
+            return mx.concatenate(parts)
+
+        if rank is not None:
+            monkeypatch.setattr(mx.distributed, "all_gather", gather)
+        actual = lm._logits_from_norm(h)
+        cap = lm.config.final_logit_softcapping
+        if cap:
+            expected = mx.tanh(expected / cap) * cap
+        equal(actual, expected[..., : lm.config.unpadded_vocab_size], atol=0, rtol=0)
+        assert actual.dtype == mx.float32
+        assert lm.lm_head.weight.dtype == mx.bfloat16
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
+            assert lm._head_projection_cache[0] is lm.lm_head.weight
+        assert not any(
+            "_head_projection_cache" in name
+            for name, _ in tree_flatten(lm.parameters())
+        )
+
+
 def test_inkling2_dspark_draft_context_window_and_budget():
     target, draft = inkling2_dspark_case()
     draft.bind(target)

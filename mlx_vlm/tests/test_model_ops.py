@@ -1082,6 +1082,34 @@ def test_masked_mxfp8_switch_glu_matches_independent_decode(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize(
+    "inputs,outputs", [(4608, 6144), (4608, 1024), (4608, 768), (6144, 4608)]
+)
+def test_inkling2_partitioned_projection_preserves_native_matrix_reduction(
+    rank, inputs, outputs
+):
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.inkling2.language import Attention
+
+    mx.random.seed(98)
+    full = nn.Linear(inputs, outputs, bias=False)
+    full.weight = full.weight.astype(mx.bfloat16)
+    local = nn.Linear(inputs, outputs // 2, bias=False)
+    start = rank * (outputs // 2)
+    local.weight = mx.contiguous(full.weight[start : start + outputs // 2])
+    attention = SimpleNamespace(sharding_group=SimpleNamespace(rank=lambda: rank))
+    for length in (1, 3, 4, 8, 32, 128):
+        x = mx.random.normal((4, length, inputs)).astype(mx.bfloat16)
+        actual = Attention._project(attention, local, x)
+        expected = full(x)[..., start : start + outputs // 2]
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("batch,length", [(1, 1), (2, 1), (2, 4), (8, 4)])
 @pytest.mark.parametrize("start", [0, 4])

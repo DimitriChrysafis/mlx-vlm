@@ -3141,6 +3141,76 @@ def test_inkling2_shard_preserves_scalar_outer_scales():
     assert projection.weight_scale_2 is scale
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Requires Metal")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("layer_index", [0, 5])
+def test_inkling2_attention_shards_complete_heads_and_keeps_sink(rank, layer_index):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    cfg = TextConfig(
+        hidden_size=256,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=32,
+        swa_num_attention_heads=16,
+        swa_num_key_value_heads=8,
+        swa_head_dim=32,
+        d_rel=16,
+    )
+    attention = Attention(cfg, layer_index)
+    original = dict(tree_flatten(attention.parameters()))
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+    attention.shard(group)
+    assert attention.n_heads == 8 and attention.n_kv == 4
+    assert attention.sharding_group is group
+    assert attention.head_start == rank * 8
+    for key, value in tree_flatten(attention.parameters()):
+        old = original[key]
+        if key in ("sink_proj.weight", "rel_proj"):
+            assert value is old
+        else:
+            axis = 1 if key.endswith("static_weight") else 0
+            width = old.shape[axis] // 2
+            slices = [slice(None)] * old.ndim
+            slices[axis] = slice(rank * width, (rank + 1) * width)
+            assert mx.array_equal(value, old[tuple(slices)]).item(), key
+    partition = dict(tree_flatten(attention.parameters()))
+    attention.shard(group)
+    assert all(v is partition[k] for k, v in tree_flatten(attention.parameters()))
+
+
+@pytest.mark.parametrize(
+    "reason", ["three_ranks", "quantized_dynamic", "small_projection"]
+)
+def test_inkling2_attention_shard_fallback_preserves_parameters(reason):
+    from mlx_vlm.models.inkling2.config import TextConfig
+    from mlx_vlm.models.inkling2.language import Attention
+
+    attention = Attention(
+        TextConfig(
+            hidden_size=256,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=32,
+            d_rel=16,
+        ),
+        5,
+    )
+    if reason == "quantized_dynamic":
+        attention.k_sconv.weight_proj = attention.k_sconv.weight_proj.to_quantized()
+    if reason == "small_projection":
+        attention.r_proj = nn.Linear(256, 16, bias=False)
+    original = dict(tree_flatten(attention.parameters()))
+    attention.shard(
+        SimpleNamespace(
+            size=lambda: 3 if reason == "three_ranks" else 2, rank=lambda: 0
+        )
+    )
+    assert attention.sharding_group is None
+    assert all(v is original[k] for k, v in tree_flatten(attention.parameters()))
+
+
 @pytest.mark.parametrize(
     "family", ["minimax_m3", "minimax_m3_nvfp4", "minimax_m3_packed"]
 )

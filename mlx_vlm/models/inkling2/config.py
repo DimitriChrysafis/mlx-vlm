@@ -50,7 +50,7 @@ class TextConfig(BaseModelConfig):
 
 
 def validate_sharding(config: dict, world_size: int):
-    """Cluster preflight: only the expert axis is partitioned."""
+    """Require expert ownership; compatible two-rank attention also partitions."""
     text = config.get("text_config") or config
     count = text.get("n_routed_experts", TextConfig.n_routed_experts)
     if not 1 <= world_size <= count:
