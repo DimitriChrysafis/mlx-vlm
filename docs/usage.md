@@ -591,9 +591,7 @@ Other stages identify work without inventing a percentage: `resolving_model`,
 `converting_weights`, `sanitizing_weights`, `installing_weights`, `loading_adapter`
 and `loading_processor`. `loaded` ends library loading; it includes `lazy`, since
 `lazy=True` still defers parameter evaluation. A loading exception emits `failed`
-and is re-raised. A callback can raise `mlx_vlm.load_progress.ModelLoadCancelled`
-to abort at a loader boundary; `load()` emits `cancelled` and re-raises it.
-Without a callback, ordinary whole-model evaluation is unchanged.
+and is re-raised. Without a callback, ordinary whole-model evaluation is unchanged.
 
 For the server's text/multimodal chat loader, poll authenticated `GET /health`
 while the first Chat Completions, Responses or Messages request loads the model.
@@ -642,13 +640,9 @@ by model kind, including the model path and error, and the HTTP server remains
 available. A failed text load leaves `model_ready: false`; a later inference or
 warmup request can retry loading or choose a different model. The failure record
 describes the startup attempt. Without `--model`, on-demand loading still works.
-Graceful shutdown cancels local text preloading through its existing progress
-callbacks, stopping before the next checkpoint file, layer evaluation or loading
-stage. It releases partial weights, skips remaining preloads and unloads cached
-models; cancellation is not reported as a preload failure. A native operation or
-download already executing must return before cancellation can be observed.
-Separate image/audio loaders without these callbacks still drain their current
-load. Distributed collective shutdown remains coordinated across ranks.
+Graceful shutdown waits for the current loader to finish, skips remaining
+preloads, and releases cached models. It does not interrupt an in-flight native
+load or download, so shutdown can wait for that operation.
 
 ### Live settings (`/v1/settings`)
 

@@ -52,7 +52,6 @@ from mlx_vlm import apc, sample_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
-from mlx_vlm.load_progress import ModelLoadCancelled
 from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.gpt_oss.processing_gpt_oss import (
     HARMONY_RESPONSE_TEMPLATE,
@@ -2063,35 +2062,6 @@ def test_model_resources_forward_loading_observer(monkeypatch, distributed):
         "demo", None, progress_callback=events.append
     ) == (model, processor, model.config)
     assert events == [{"stage": "loading_checkpoint"}]
-
-
-def test_cancelled_loader_releases_partial_weights(monkeypatch, caplog):
-    owners = []
-
-    class Weights:
-        pass
-
-    def load(*args, progress_callback, **kwargs):
-        weights = Weights()
-        owners.append(weakref.ref(weights))
-        progress_callback({"stage": "evaluating_layers"})
-
-    def cancel(event):
-        raise ModelLoadCancelled("shutdown")
-
-    monkeypatch.setattr(generation, "load", load)
-    monkeypatch.setattr(server.runtime, "distributed_worker", None)
-    gen = _generator(load_progress_callback=cancel)
-    worker = Thread(target=gen._run)
-    worker.start()
-    worker.join(5)
-    assert not worker.is_alive()
-    assert gen._ready.is_set()
-    assert isinstance(gen._load_error, ModelLoadCancelled)
-    assert gen._load_error.__traceback__ is None
-    gc.collect()
-    assert owners[0]() is None
-    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -7026,10 +6996,7 @@ class TestResponseGenerator:
             monkeypatch.setenv("MLX_VLM_PRELOAD_" + key, kind)
         calls = []
 
-        def load(
-            model_path, adapter_path=None, *, model_kind="auto", cancel_event=None
-        ):
-            assert (cancel_event is not None) == (model_kind == "text_generation")
+        def load(model_path, adapter_path=None, *, model_kind="auto"):
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
@@ -7945,7 +7912,7 @@ def test_startup_preload_serves_progress_and_recovers(
 
 
 @pytest.mark.parametrize("cancel_shutdown", [False, True])
-def test_shutdown_cancels_preload_at_next_boundary(
+def test_shutdown_drains_preload_before_unloading(
     settings_client, monkeypatch, cancel_shutdown
 ):
     _, generators = settings_client
@@ -7953,18 +7920,11 @@ def test_shutdown_cancels_preload_at_next_boundary(
     monkeypatch.setenv("MLX_VLM_PRELOAD_MESH_MODEL", "must-not-start")
     entered, release = Event(), Event()
     generator_class = server._app_module.ResponseGenerator
-    ready = Mock(wraps=generator_class.wait_until_ready)
+    ready = generator_class.wait_until_ready
 
     def loading(self):
-        self.load_progress_callback(
-            {"stage": "evaluating_layers", "completed_layers": 0, "total_layers": 2}
-        )
         entered.set()
-        # Stand in for one indivisible native evaluation already in progress.
         assert release.wait(5)
-        self.load_progress_callback(
-            {"stage": "evaluating_layers", "completed_layers": 1, "total_layers": 2}
-        )
         return ready(self)
 
     monkeypatch.setattr(generator_class, "wait_until_ready", loading)
@@ -7991,35 +7951,9 @@ def test_shutdown_cancels_preload_at_next_boundary(
                 await asyncio.wait_for(closing, 2)
         assert generators[0].stopped and not server.runtime.model_cache
         assert not server.runtime.preload_in_progress
-        assert not server.runtime.preload_failures
-        ready.assert_not_called()
         mesh.assert_not_called()
 
     asyncio.run(check())
-
-
-@pytest.mark.parametrize("when", ["before_start", "after_initialize"])
-def test_preload_cancellation_does_not_publish_model(settings_client, when):
-    _, generators = settings_client
-    stopping = Event()
-    if when == "before_start":
-        stopping.set()
-
-    original = server._app_module.ResponseGenerator.wait_until_ready
-
-    def ready(self):
-        result = original(self)
-        stopping.set()
-        return result
-
-    with patch.object(server._app_module.ResponseGenerator, "wait_until_ready", ready):
-        with pytest.raises(ModelLoadCancelled):
-            server._app_module.get_cached_model("demo", cancel_event=stopping)
-    assert len(generators) == (when == "after_initialize")
-    assert all(g.stopped for g in generators)
-    assert not server.runtime.model_cache
-    assert server.runtime.response_generator is None
-    assert server.runtime.apc_manager is None
 
 
 @pytest.mark.parametrize("fail", [False, True])
