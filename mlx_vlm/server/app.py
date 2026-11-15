@@ -455,12 +455,7 @@ async def lifespan(app):
 
     async with managed_workers(runtime.distributed_coordinator):
         async with _application_lifespan(app):
-
-            try:
-                yield
-            finally:
-                if runtime.cluster_manager is not None:
-                    await runtime.cluster_manager.close()
+            yield
 
 
 @asynccontextmanager
@@ -527,15 +522,25 @@ async def _application_lifespan(app):
     finally:
         stopping.set()
         try:
-            # The loading observer aborts at the next safe boundary. Join its
-            # cleanup before clearing caches, even if shutdown itself is cancelled.
-            try:
-                await asyncio.shield(preload_task)
-            except asyncio.CancelledError:
-                await preload_task
-                raise
+            if runtime.cluster_manager is not None:
+                await runtime.cluster_manager.close()
+            elif (
+                runtime.distributed_coordinator is not None
+                and runtime.distributed_coordinator.launcher is not None
+            ):
+                # Stop owned ranks before waiting for local native loading.
+                await runtime.distributed_coordinator.launcher.close()
         finally:
-            await asyncio.to_thread(unload_model_sync)
+            try:
+                # Join the loading observer's cleanup before clearing caches,
+                # even if shutdown itself is cancelled.
+                try:
+                    await asyncio.shield(preload_task)
+                except asyncio.CancelledError:
+                    await preload_task
+                    raise
+            finally:
+                await asyncio.to_thread(unload_model_sync)
 
 
 async def _preload_models(models, stopping):

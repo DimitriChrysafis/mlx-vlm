@@ -138,9 +138,11 @@ class WorkerLauncher:
         }
         if self.config.compaction_key_file:
             env["MLX_VLM_COMPACTION_KEY_FILE"] = str(self.config.compaction_key_file)
+        # The remote stdlib supervisor already owns this worker and enforces
+        # launch.shutdown_timeout; avoid nesting another process supervisor.
         args = [
-            "-m",
-            "mlx_vlm.server",
+            "-c",
+            "from mlx_vlm.server.cli import main; main(supervised=True)",
             "--distributed-worker",
             "--distributed-backend",
             self.launch.backend,

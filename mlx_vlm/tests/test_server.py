@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -1419,7 +1420,7 @@ class TestImageProcessingOptions:
             for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
                 os.environ.pop(key, None)
             if valid:
-                cli.main()
+                cli.main(supervised=True)
                 assert os.environ["MLX_VLM_MIN_PIXELS"] == "1048576"
                 assert os.environ["MLX_VLM_MAX_PIXELS"] == "4194304"
                 assert server.runtime.config.image_pixel_limits() == dict(
@@ -1435,7 +1436,7 @@ class TestImageProcessingOptions:
                 run.assert_called_once()
             else:
                 with pytest.raises(SystemExit):
-                    cli.main()
+                    cli.main(supervised=True)
                 run.assert_not_called()
 
     def test_worker_preprocessing_and_context_budget(self, monkeypatch):
@@ -2492,7 +2493,7 @@ class TestModelDiscovery:
         )
         monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
         with patch.object(cli.uvicorn, "run") as run:
-            cli.main()
+            cli.main(supervised=True)
         assert os.environ["MLX_VLM_MODEL_PATHS"] == (
             os.pathsep.join(paths) if use_cli_paths else "/existing/models"
         )
@@ -7008,7 +7009,7 @@ class TestResponseGenerator:
                 "QUANTIZED_KV_START",
             ]:
                 os.environ.pop(key, None)
-            cli.main()
+            cli.main(supervised=True)
             _assert_fields(os.environ, **expected)
             assert run.call_args.kwargs["host"] == "127.0.0.1"
 
@@ -7942,6 +7943,71 @@ def test_startup_preload_serves_progress_and_recovers(
         )
 
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("blocked", ["native", "thread", None])
+def test_cli_process_shutdown_deadline(tmp_path, blocked):
+    from mlx_vlm.server import _server_process
+
+    record = tmp_path / "pid"
+    code = (
+        "import ctypes, os, signal, threading, time; from pathlib import Path; "
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if blocked else "")
+        + f"Path({str(record)!r}).write_text(str(os.getpid())); "
+        + {
+            "native": "ctypes.PyDLL(None).sleep(60)",
+            "thread": "threading.Thread(target=lambda: time.sleep(60)).start()",
+            None: "time.sleep(60)",
+        }[blocked]
+    )
+    # A separate, unrelated process must never be touched by shutdown.
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    owner = subprocess.Popen(
+        [sys.executable, _server_process.__file__, "0.15", sys.executable, "-c", code],
+        stderr=subprocess.PIPE,
+    )
+    child = None
+    try:
+        deadline = time.monotonic() + 5
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child = int(record.read_text())
+        started = time.monotonic()
+        owner.terminate()
+        _, errors = owner.communicate(timeout=3)
+        assert time.monotonic() - started < 2
+        assert owner.returncode == (124 if blocked else 128 + signal.SIGTERM)
+        assert (b"shutdown deadline reached" in errors) == bool(blocked)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        assert unrelated.poll() is None
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.wait()
+        if child is not None:
+            try:
+                os.killpg(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        unrelated.terminate()
+        unrelated.wait()
+
+
+@pytest.mark.parametrize("timeout", ["0", "0.2", "-1", "nan", "inf"])
+def test_cli_supervision_validates_deadline(monkeypatch, timeout):
+    monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", "--shutdown-timeout", timeout])
+    with patch.object(os, "execv") as execute, patch.object(cli.uvicorn, "run") as run:
+        if timeout in ("0", "0.2"):
+            cli.main()
+            command = execute.call_args.args[1]
+            assert command[2] == str(float(timeout))
+            assert "main(supervised=True)" in command[5]
+        else:
+            with pytest.raises(SystemExit):
+                cli.main()
+            execute.assert_not_called()
+        run.assert_not_called()
 
 
 @pytest.mark.parametrize("cancel_shutdown", [False, True])

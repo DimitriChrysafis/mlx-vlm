@@ -1,6 +1,9 @@
 import argparse
 import logging
+import math
 import os
+import sys
+from pathlib import Path
 
 import uvicorn
 
@@ -31,7 +34,7 @@ DEFAULT_SERVER_PORT = 8080
 logger = logging.getLogger("mlx_vlm.server")
 
 
-def main():
+def main(*, supervised=False):
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
         "--host",
@@ -334,6 +337,12 @@ def main():
         help="Enable auto-reload for development.",
     )
     parser.add_argument(
+        "--shutdown-timeout",
+        type=float,
+        default=5,
+        help="Seconds allowed for graceful shutdown before terminating the owned server process (default: 5; 0: immediate).",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -341,6 +350,8 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    if not math.isfinite(args.shutdown_timeout) or args.shutdown_timeout < 0:
+        parser.error("--shutdown-timeout must be a finite non-negative number")
     if args.distributed_config or args.distributed_worker:
         if args.reload:
             parser.error("Distributed serving does not support --reload")
@@ -394,6 +405,23 @@ def main():
         GenerationArguments(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
     except ValueError as exc:
         parser.error(str(exc))
+    if not supervised:
+        # Replace the CLI with a stdlib-only process owner. MLX/native loading
+        # happens in its child, so even a native call holding the GIL cannot
+        # prevent signal handling or enforcement of the shutdown deadline.
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                str(Path(__file__).with_name("_server_process.py")),
+                str(args.shutdown_timeout),
+                sys.executable,
+                "-c",
+                "from mlx_vlm.server.cli import main; main(supervised=True)",
+                *sys.argv[1:],
+            ],
+        )
+        return
     if args.min_pixels is not None:
         os.environ["MLX_VLM_MIN_PIXELS"] = str(args.min_pixels)
     if args.max_pixels is not None:
