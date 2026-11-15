@@ -1086,6 +1086,7 @@ class ResponseGenerator:
         draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
         load_progress_callback=None,
+        draft_block_size: Optional[int] = None,
     ):
         self.model_path = model_path
         self.load_progress_callback = load_progress_callback
@@ -1097,6 +1098,7 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model_path = draft_model_path
         self.draft_kind_override = draft_kind
+        self.draft_block_size = draft_block_size
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1196,10 +1198,12 @@ class ResponseGenerator:
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
-        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = self.draft_model_path or os.environ.get(
-            "MLX_VLM_DRAFT_MODEL"
-        )
+        worker = runtime.distributed_worker
+        draft_kind = self.draft_kind_override
+        draft_model_path = self.draft_model_path
+        if worker is None:
+            draft_kind = draft_kind or os.environ.get("MLX_VLM_DRAFT_KIND")
+            draft_model_path = draft_model_path or os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
             if callback is not None:
                 callback({"stage": "loading_draft", "draft_model": draft_model_path})
@@ -1213,7 +1217,17 @@ class ResponseGenerator:
                 draft_kind or "auto",
                 draft_model_path,
             )
-            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
+            if worker is not None:
+                draft_model, resolved_kind = worker.load_drafter(
+                    model,
+                    draft_model_path,
+                    draft_kind,
+                    self._effective_draft_block_size(),
+                )
+            else:
+                draft_model, resolved_kind = load_drafter(
+                    draft_model_path, kind=draft_kind
+                )
             if draft_kind is None:
                 logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
             elif resolved_kind != draft_kind:
@@ -1224,7 +1238,10 @@ class ResponseGenerator:
                 )
             draft_kind = resolved_kind
             try:
-                validate_drafter_compatibility(model, draft_model, draft_kind)
+                # Workers already validated and agreed before leaving their
+                # draft-loading collective. Local serving retains its fallback.
+                if worker is None:
+                    validate_drafter_compatibility(model, draft_model, draft_kind)
             except ValueError as e:
                 logger.warning(
                     "Speculative drafter is incompatible with the target model; "
@@ -1249,6 +1266,12 @@ class ResponseGenerator:
         if self.apc_manager is not None:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
+
+    def _effective_draft_block_size(self):
+        size = getattr(self, "draft_block_size", None)
+        if size is None and runtime.distributed_worker is None:
+            size = _get_draft_block_size_from_env()
+        return size
 
     def generate(
         self,
@@ -1900,7 +1923,7 @@ class ResponseGenerator:
                 apc_manager=self.apc_manager,
                 draft_model=self.draft_model,
                 draft_kind=self.draft_kind,
-                draft_block_size=_get_draft_block_size_from_env(),
+                draft_block_size=self._effective_draft_block_size(),
                 greedy_sampling=args.temperature == 0,
                 prefill_step_size=self._effective_prefill_step_size(),
             )

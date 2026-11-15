@@ -719,6 +719,13 @@ def _get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    draft = None
+    if runtime.distributed_worker is not None:
+        from .distributed_schedule import request_scope
+
+        scope = request_scope.get()
+        draft = scope.draft if scope is not None else None
+        cache_key += (draft.model_dump_json() if draft is not None else None,)
     if revision is not None:
         cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
@@ -1060,6 +1067,13 @@ def _get_cached_model(
 
     progress = LoadingProgress(model_path, publish_loading)
     progress("starting")
+    draft_options = dict(draft_model_path=cfg.draft_model, draft_kind=cfg.draft_kind)
+    if runtime.distributed_worker is not None:
+        draft_options = dict(
+            draft_model_path=draft.model if draft is not None else None,
+            draft_kind=draft.kind if draft is not None else None,
+            draft_block_size=draft.block_size if draft is not None else None,
+        )
     response_generator = None
     try:
         response_generator = ResponseGenerator(
@@ -1076,8 +1090,7 @@ def _get_cached_model(
             quantized_kv_start=quantized_kv_start,
             top_logprobs_k=get_top_logprobs_k(),
             apc_manager=runtime.apc_manager,
-            draft_model_path=cfg.draft_model,
-            draft_kind=cfg.draft_kind,
+            **draft_options,
             load_progress_callback=progress.update,
         )
         model, processor, config = response_generator.wait_until_ready()
@@ -1349,7 +1362,21 @@ async def route_distributed_request(request: Request, call_next):
                 raise HTTPException(
                     400, "Send requests through the distributed coordinator"
                 )
-            token = request_scope.set(RequestScope(request_id))
+            from pydantic import ValidationError
+
+            from .cluster_types import SpeculativeDraft
+
+            try:
+                draft = (
+                    SpeculativeDraft.model_validate(body["_distributed_draft"])
+                    if body.get("_distributed_draft") is not None
+                    else None
+                )
+            except ValidationError as error:
+                raise HTTPException(
+                    422, "Invalid coordinated draft configuration"
+                ) from error
+            token = request_scope.set(RequestScope(request_id, draft=draft))
             try:
                 return await call_next(request)
             finally:
