@@ -728,9 +728,7 @@ def test_http_flag_and_authentication_preserve_local_routes(
     path = prefix + "/responses" + suffix
     relay = AsyncMock(return_value=({"answer": "distributed"}, 200))
     monkeypatch.setattr(
-        runtime,
-        "distributed_coordinator",
-        NS(relay=relay, config=NS(launch=None), launcher=None),
+        runtime, "distributed_coordinator", NS(relay=relay, config=NS(launch=None))
     )
     monkeypatch.setattr(runtime, "distributed_worker", None)
     monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "coordinator-key")
@@ -908,7 +906,7 @@ def test_worker_startup_disables_independent_caches_and_hub_access(
     )
     run = Mock()
     monkeypatch.setattr(cli.uvicorn, "run", run)
-    cli.main(supervised=True)
+    cli.main()
     assert runtime.distributed_worker is worker
     assert runtime.config.apc_enabled is False
     assert runtime.config.vision_cache_size == 0
@@ -939,7 +937,7 @@ def test_cli_rejects_incomplete_cluster_setup(monkeypatch, args):
     run = Mock()
     monkeypatch.setattr(cli.uvicorn, "run", run)
     with pytest.raises(SystemExit):
-        cli.main(supervised=True)
+        cli.main()
     run.assert_not_called()
 
 

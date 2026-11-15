@@ -98,32 +98,6 @@ def own_launcher(monkeypatch):
     return create
 
 
-@pytest.mark.parametrize("owned", [False, True])
-async def test_shutdown_stops_owned_workers_before_waiting_for_loading(
-    control, monkeypatch, owned
-):
-    stopped = asyncio.Event()
-    launcher = NS(close=AsyncMock(side_effect=stopped.set)) if owned else None
-    monkeypatch.setattr(runtime, "distributed_coordinator", NS(launcher=launcher))
-
-    async def loading():
-        try:
-            await asyncio.Event().wait()
-        finally:
-            if owned:
-                await stopped.wait()
-
-    task = asyncio.create_task(loading())
-    control.tasks.add(task)
-    await asyncio.sleep(0)
-    await asyncio.wait_for(control.close(), 1)
-    assert task.cancelled()
-    if owned:
-        launcher.close.assert_awaited_once()
-    else:
-        assert not stopped.is_set()
-
-
 async def register_pair(control):
     for node_id in ("a", "b"):
         await control.register(

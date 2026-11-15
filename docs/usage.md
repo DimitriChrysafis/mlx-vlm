@@ -642,24 +642,13 @@ by model kind, including the model path and error, and the HTTP server remains
 available. A failed text load leaves `model_ready: false`; a later inference or
 warmup request can retry loading or choose a different model. The failure record
 describes the startup attempt. Without `--model`, on-demand loading still works.
-The CLI runs the HTTP/model runtime in an owned child process. On SIGINT, SIGTERM
-or SIGHUP, its independent supervisor requests graceful shutdown and enforces
-`--shutdown-timeout` (default: 5 seconds). If a native operation, download,
-image/audio loader or cleanup cannot stop within that deadline, the supervisor
-terminates the owned process group and waits for its exit. A second signal or
-`--shutdown-timeout 0` skips the grace period. Deadline termination exits with
-status 124 and releases the process's model memory; it does not report successful
-graceful cleanup. Downloads may retain resumable partial files.
-
-During the grace period, local text preloading still cancels at its next file,
-layer or loading-stage callback, releases partial weights and skips queued
-preloads. Owned distributed workers are stopped before awaiting cancelled
-cluster loading operations; their existing independent supervisors enforce
-`launch.shutdown_timeout`. Externally managed workers are never killed.
-
-Importing `mlx_vlm.server:app` into another ASGI host does not install a process
-supervisor or terminate the embedding application. That host must enforce its
-own process shutdown deadline. Use the MLX-VLM CLI for the supervised behavior.
+Graceful shutdown cancels local text preloading through its existing progress
+callbacks, stopping before the next checkpoint file, layer evaluation or loading
+stage. It releases partial weights, skips remaining preloads and unloads cached
+models; cancellation is not reported as a preload failure. A native operation or
+download already executing must return before cancellation can be observed.
+Separate image/audio loaders without these callbacks still drain their current
+load. Distributed collective shutdown remains coordinated across ranks.
 
 ### Live settings (`/v1/settings`)
 

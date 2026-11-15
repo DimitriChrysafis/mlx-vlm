@@ -1048,15 +1048,12 @@ class ClusterManager:
     async def close(self):
         for stop in self.transfer_stops.values():
             stop.set()
-        tasks = tuple(self.tasks)
-        for task in tasks:
+        for task in self.tasks:
             task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
         coordinator = runtime.distributed_coordinator
         if coordinator and coordinator.launcher:
             await coordinator.launcher.close()
-        # Stop owned native workers before awaiting cancelled loading operations.
-        # A collective blocked inside native code cannot observe task cancellation.
-        await asyncio.gather(*tasks, return_exceptions=True)
         if self.transfers:
             await asyncio.to_thread(self.transfers.close)
 
