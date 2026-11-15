@@ -371,6 +371,12 @@ hostfile/topology requires reconfiguration while stopped. It does not synthesize
 RDMA wiring from IP addresses. Topology is ultimately validated by initializing
 the configured MLX backend and successfully running collectives, not discovery.
 
+Managed launches honor the experimental, default-off `launch.fast_sync` boolean
+in `cluster.json`. It sets MLX fast synchronization on every worker before Python
+starts; it is not an inference-request setting and does not alter attached
+external workers. See [distributed launch configuration](distributed-serving.md)
+for restart requirements and MLX's deadlock warning.
+
 `stop` first rejects new distributed admissions, then waits for active requests
 to drain, up to `drain_timeout_seconds` (default 60). A timeout is observable and
 never silently kills active inference. Retained continuations return

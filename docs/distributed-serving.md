@@ -138,6 +138,7 @@ are examples to replace with your deployment's values:
     "host": "0.0.0.0",
     "port": 8283,
     "max_num_seqs": 8,
+    "fast_sync": false,
     "startup_timeout": 120,
     "shutdown_timeout": 10
   }
@@ -164,6 +165,23 @@ supports `jaccl` and `ring`.
 For independent groups on the same hosts, set `launch.starting_port` to a free
 collective control port (default `32323`), and use distinct worker HTTP ports.
 This forwards MLX's `--starting-port` option; it does not change `launch.port`.
+
+`launch.fast_sync` is an **experimental**, default-off boolean. Set it to `true`
+to enable MLX's faster CPU/GPU synchronization for every managed worker. The
+launcher sends `MLX_METAL_FAST_SYNCH=1` (or `0` when disabled) through the supervisor
+before the worker Python process starts and imports MLX. This overrides inherited
+host/hostfile settings; configure it with `launch.fast_sync`, not `launch.env`.
+It applies both at public-server startup and to cluster API `mode: "launch"`.
+Externally managed workers attached with `mode: "attach"` are unaffected.
+
+MLX [caches this setting on first use](https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/utils.h#L203-L206),
+so changing an environment variable during generation is insufficient. Drain and
+stop the group, update `cluster.json`, and restart the public server to load the
+configuration and launch fresh workers. MLX [warns that fast synchronization can
+deadlock and leave the GPU wedged](https://github.com/ml-explore/mlx/blob/main/docs/src/usage/distributed.rst).
+Keep it off unless testing a known workload; a short successful run does not
+establish long-running stability. This option exposes the existing MLX setting;
+it does not add another speedup to clients already enabling it.
 
 Start only the public server, using your existing keys:
 
