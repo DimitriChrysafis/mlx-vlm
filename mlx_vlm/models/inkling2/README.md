@@ -69,10 +69,10 @@ also partition attention heads, complete output-projection rows, and the
 corresponding KV/convolution state. Heads are gathered before the output
 projection so each dot product retains its original reduction. The small sink
 projection stays replicated because splitting its rows changes prefill rounding.
-For matrix projections with more than 15 input rows, zero padding preserves the
-original output width and kernel dispatch before selecting the owned rows. This
-fallback contains no remote weights; it protects prefill and larger verification
-blocks from shape-dependent rounding changes.
+Zero padding preserves the original projection width and kernel dispatch before
+selecting the owned rows. This applies to both short decode and larger prefill or
+verification batches: older GPUs can change reductions even for one token when
+the output width is halved. The padding contains no remote weights.
 Routing, vision, embeddings, and relative projections remain replicated.
 Other group sizes and unsupported attention layouts retain replicated attention.
 Each rank must own at least one expert;
@@ -286,7 +286,7 @@ DSpark block three, versus 40.66 without DSpark. A separate two-replica result
 of 63.19 tokens/s did not satisfy the shared-model requirement and is excluded
 from that target.
 
-The retained implementation now partitions attention heads and expert weights
+The benchmarked implementation partitions attention heads and expert weights
 across the same two M3 Ultras. Neither Mac holds a complete target model.
 A fresh benchmark uses the same requests, native mixed precision, 1,025 input
 and 128 output tokens per request, 128-token per-row prefill chunks, fresh caches,
@@ -320,6 +320,10 @@ match exactly. Another 144 real-weight expert checks pass on each rank, covering
 all 48 layers at lengths one, three and eight; 248 focused regression tests pass.
 An initially split matrix path failed the eight-token check and was replaced by
 the zero-padding fallback described above before these final measurements.
+
+These throughput measurements predate extending the projection padding to short
+decode batches for parity on older GPUs. The current portable path preserves the
+full projection width at every length; its throughput has not been remeasured.
 
 These checks preserve the previous MLX arithmetic and native mixed BF16/FP32
 boundaries. They do not remove the existing ON/OFF or CPU-reference differences.

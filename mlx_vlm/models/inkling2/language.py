@@ -65,6 +65,7 @@ def _softcapped_swiglu(up, gate, gate_cap, up_cap):
 def _route(x, weight, bias, top_k, route_scale):
     scores = mx.sigmoid(x.astype(mx.float32) @ weight.astype(mx.float32).T)
     indices = mx.argpartition(-(scores + bias), top_k - 1, axis=-1)[..., :top_k]
+    indices = mx.stop_gradient(indices)
     weights = mx.take_along_axis(scores, indices, axis=-1)
     weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20) * route_scale
     return indices, weights
@@ -363,11 +364,11 @@ class Attention(nn.Module):
         )
 
     def _project(self, projection, x):
-        if self.sharding_group is None or x.size // x.shape[-1] <= 15:
+        if self.sharding_group is None:
             return projection(x)
-        # Matrix kernels can change reduction order when N is halved. Preserve
-        # the original N with zero rows for the other rank, then select our
-        # complete rows. No remote weights are stored or used by this fallback.
+        # Both GEMV and GEMM dispatch can depend on N, including short batches
+        # on older GPUs. Preserve the original N with zero rows for the other
+        # rank, then select our complete rows. No remote weights are retained.
         width = projection.weight.shape[0]
         start = self.sharding_group.rank() * width
         weight = mx.pad(projection.weight, ((start, width - start), (0, 0)))
