@@ -4506,3 +4506,146 @@ def test_deepseek_v41_native_packed_weights(bits):
         mx.dequantize(packed, scales, group_size=32, bits=bits, mode=mode),
     )
     assert split.quantization_from_source(converted, {})[name]["mode"] == mode
+
+
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("initial_length,decode", [(3, 0), (8, 0), (8, 3), (17, 1)])
+@parametrize("block", [2, 3, 8])
+def test_rotating_prefix_kernel_matches_independent_replay(
+    dtype, initial_length, decode, block, monkeypatch
+):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    base = BatchRotatingKVCache(8, [0, 2, 1, 0])
+    keys = mx.random.normal((4, 2, initial_length, 16)).astype(dtype)
+    values = mx.random.normal((4, 2, initial_length, 24)).astype(dtype)
+    base.update_and_fetch(keys, values)
+    for _ in range(decode):
+        base.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+    actual, reference = deepcopy(base), deepcopy(base)
+    for lengths in (
+        [block, 1, block - 1, 0],
+        [1] * 4,
+        [block] * 4,
+        [0] * 4,
+        [block - 1] * 4,
+    ):
+        k = mx.random.normal((4, 2, block, 16)).astype(dtype)
+        v = mx.random.normal((4, 2, block, 24)).astype(dtype)
+        a = start_speculative_cache([actual], block)
+        b = start_speculative_cache([reference], block)
+        actual.update_and_fetch(k, v)
+        reference.update_and_fetch(k, v)
+        a.commit(lengths)
+        with monkeypatch.context() as patch:
+            patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+            b.commit(lengths)
+        equal(actual.state, reference.state, atol=0, rtol=0)
+        assert actual.meta_state == reference.meta_state
+        assert "update_and_fetch" not in actual.__dict__
+    # Retained cache rows remain usable after filtering and snapshot/restore.
+    actual.filter([3, 1])
+    reference.filter([3, 1])
+    actual = deepcopy(actual)
+    a, b = start_speculative_cache([actual], block), start_speculative_cache(
+        [reference], block
+    )
+    actual.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    reference.update_and_fetch(k[[3, 1]], v[[3, 1]])
+    a.commit([block, 0])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([block, 0])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.meta_state == reference.meta_state
+
+
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@parametrize("total", [2, 3, 8])
+@parametrize("has_initial", [False, True])
+def test_temporal_prefix_selection_strides_and_zero_acceptance(
+    dtype, total, has_initial, monkeypatch
+):
+    from mlx_vlm.speculative import cache_kernels
+
+    # Views retain nontrivial batch, time and feature strides.
+    states = mx.random.normal((4, total + 1, 3, 38)).astype(dtype)[..., ::2]
+    middle, final = states[:, 1:total], states[:, total]
+    initial = states[:, 0] if has_initial else None
+    lengths = [0, 1, total - 1, total]
+    record = ("states", middle, final)
+    actual = ArraysCache._select_speculative_states(record, initial, lengths, total)
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "select_temporal_states", lambda *args: None)
+        expected = ArraysCache._select_speculative_states(
+            record, initial, lengths, total
+        )
+    equal(actual, expected, atol=0, rtol=0)
+
+
+def test_temporal_prefix_selection_retains_promoted_initial_dtype():
+    initial = mx.full((4, 3), 1.001, mx.float32)
+    middle = mx.full((4, 1, 3), 2, mx.bfloat16)
+    final = mx.full((4, 3), 3, mx.bfloat16)
+    output = ArraysCache._select_speculative_states(
+        ("states", middle, final), initial, [0, 1, 2, 0], 2
+    )
+    assert output.dtype == mx.float32
+    equal(
+        output,
+        mx.concatenate(
+            [
+                initial[:1],
+                middle[1, :1].astype(mx.float32),
+                final[2:3].astype(mx.float32),
+                initial[3:],
+            ]
+        ),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_rotating_prefix_commit_retains_incoming_dtype_promotion(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    actual = BatchRotatingKVCache(8, [0, 0])
+    old = mx.ones((2, 1, 12, 16), mx.bfloat16)
+    actual.update_and_fetch(old, old)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 1.001, mx.float32)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert actual.keys.dtype == actual.values.dtype == mx.float32
+
+
+def test_rotating_prefix_commit_preserves_subclass_update_semantics(monkeypatch):
+    from mlx_vlm.models.cache import BatchRotatingKVCache
+    from mlx_vlm.speculative import cache_kernels
+
+    class ScaledRotatingCache(BatchRotatingKVCache):
+        def update_and_fetch(self, keys, values):
+            return super().update_and_fetch(keys * 2, values * 2)
+
+    actual = ScaledRotatingCache(8, [0, 0])
+    prefix = mx.ones((2, 1, 12, 16))
+    actual.update_and_fetch(prefix, prefix)
+    reference = deepcopy(actual)
+    incoming = mx.full((2, 1, 3, 16), 7.0)
+    a, b = start_speculative_cache([actual], 3), start_speculative_cache([reference], 3)
+    actual.update_and_fetch(incoming, incoming)
+    reference.update_and_fetch(incoming, incoming)
+    a.commit([3, 1])
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_kernels, "commit_rotating_prefix", lambda *args: False)
+        b.commit([3, 1])
+    equal(actual.state, reference.state, atol=0, rtol=0)
+    assert bool(mx.any(actual.keys == 14).item())
