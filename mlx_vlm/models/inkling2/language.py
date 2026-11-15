@@ -18,8 +18,8 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
+from ..base import LanguageModelOutput
 from ..cache import (
     ArraysCache,
     BatchRotatingKVCache,
@@ -31,7 +31,6 @@ from ..inkling.language import InklingShortConvolution
 from ..inkling.language import LanguageModel as InklingLanguageModel
 from ..inkling.language import (
     _cache_padding_mask,
-    _clone_cache_tree,
     _next_conv_state,
     banded_additive_mask,
 )
@@ -48,6 +47,91 @@ def l2_clip(x, threshold, scale=None):
     return (x * mx.minimum(threshold / (norm + 1e-6), 1.0)).astype(dtype)
 
 
+_conv_history_kernel = mx.fast.metal_kernel(
+    name="inkling_masked_conv_history",
+    input_names=["state", "inputs", "mask"],
+    output_names=["out"],
+    ensure_row_contiguous=False,
+    source=r"""
+    uint index = thread_position_in_grid.x;
+    int B = inputs_shape[0], L = inputs_shape[1], C = inputs_shape[2];
+    int W = state_shape[1];
+    if (index >= B * L * W * C) return;
+    int c = index % C, w = (index / C) % W;
+    int t = (index / (C * W)) % L, b = index / (C * W * L);
+    int count = 0, start = 0;
+    for (int j = 0; j <= t; ++j) {
+        if (mask[b * mask_strides[0] + j * mask_strides[1]]) {
+            if (count == 0) start = j;
+            ++count;
+        }
+    }
+    int logical = count - W + w;
+    out[index] = logical < 0
+        ? state[b * state_strides[0] + (W + logical) * state_strides[1]
+                + c * state_strides[2]]
+        : inputs[b * inputs_strides[0] + (start + logical) * inputs_strides[1]
+                 + c * inputs_strides[2]];
+    """,
+)
+
+
+@mx.compile
+def _conv_state_history_fallback(state, inputs, mask):
+    width = state.shape[1]
+    count = mx.cumsum(mask.astype(mx.int32), axis=1)
+    start = mx.argmax(mask.astype(mx.int32), axis=1)
+    logical = mx.arange(width)[None, None, :] + count[:, :, None] - width
+    indices = mx.where(
+        logical >= 0,
+        width + start[:, None, None] + mx.maximum(logical, 0),
+        width + logical,
+    )
+    combined = mx.concatenate([state, inputs], axis=1)
+    return mx.take_along_axis(combined[:, None], indices[..., None], axis=2)
+
+
+def _conv_state_history(state, inputs, mask):
+    """Select every masked prefix's state without repeated prefix forwards."""
+    batch, length, channels = inputs.shape
+    width = state.shape[1]
+    if (
+        width > 0
+        and length <= 8
+        and mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+    ):
+        return _conv_history_kernel(
+            inputs=[state, inputs, mask],
+            grid=(batch * length * width * channels, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(batch, length, width, channels)],
+            output_dtypes=[state.dtype],
+        )[0]
+    return _conv_state_history_fallback(state, inputs, mask)
+
+
+def _update_conv_cache(cache, index, state, inputs, mask):
+    if cache is None:
+        return
+    speculating = getattr(cache, "is_speculating", False)
+    if speculating and mask is not None:
+        # Physical prefixes can retain different numbers of valid tokens.
+        # Avoid rebuilding a separate reduction, concat and gather per prefix.
+        states = _conv_state_history(state, inputs, mask)
+        final = states[:, -1]
+        cache.record_speculative_states(
+            index, states[:, :-1] if inputs.shape[1] > 1 else None, final
+        )
+    else:
+        final = _next_conv_state(state, inputs, mask)
+        if speculating:
+            cache.record_speculative_window(
+                index, mx.concatenate([state, inputs], axis=1), state.shape[1]
+            )
+    cache[index] = final
+
+
 class ShortConvolution(InklingShortConvolution):
     def __call__(self, x, cache=None, mask=None):
         # Keep the convolution, residual, and scaling in FP32. The checkpoint
@@ -59,8 +143,7 @@ class ShortConvolution(InklingShortConvolution):
         if state is None:
             state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]))
         context = mx.concatenate([state, inputs], axis=1)
-        if cache is not None:
-            cache[self.conv_idx] = _next_conv_state(state, inputs, mask)
+        _update_conv_cache(cache, self.conv_idx, state, inputs, mask)
         out = mx.conv1d(
             context, self.conv.weight.astype(mx.float32), groups=x.shape[-1]
         )
@@ -87,8 +170,7 @@ class DynamicShortConvolution(nn.Module):
         if state is None:
             state = mx.zeros((b, k - 1, channels), mx.float32)
         context = mx.concatenate([state, inputs], axis=1)
-        if cache is not None:
-            cache[self.conv_idx] = _next_conv_state(state, inputs, mask)
+        _update_conv_cache(cache, self.conv_idx, state, inputs, mask)
         dynamic = (
             self.weight_proj(dynamic_input)
             .astype(mx.float32)
@@ -392,14 +474,43 @@ class TextModel(nn.Module):
         return self.embed_norm(self.embed_tokens(inputs))
 
     def __call__(
-        self, inputs, cache=None, input_embeddings=None, skip_final_norm=False
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        skip_final_norm=False,
+        capture_layer_ids=None,
+        speculative_verify=False,
     ):
+        captures = {}
+        if capture_layer_ids is not None and (
+            len(capture_layer_ids) != len(set(capture_layer_ids))
+            or any(
+                type(i) is not int or not 0 <= i <= len(self.layers)
+                for i in capture_layer_ids
+            )
+        ):
+            raise ValueError("Invalid Inkling 2 capture_layer_ids")
+        requested = set(capture_layer_ids or [])
         x = self.embed(inputs) if input_embeddings is None else input_embeddings
         blocks = []
-        for layer, c in zip(self.layers, cache or [None] * len(self.layers)):
+        for i, (layer, c) in enumerate(
+            zip(self.layers, cache or [None] * len(self.layers))
+        ):
+            # DSpark taps the partial block entering the layer, not its output.
+            if i in requested:
+                captures[i] = x
             x = layer(x, blocks, c)
+            if speculative_verify and (i + 1) % 4 == 0:
+                mx.async_eval(x)
         h = self.final_input(blocks, x)[..., 0, :]
-        return h if skip_final_norm else self.norm(h).astype(x.dtype)
+        normalized = self.norm(h).astype(x.dtype)
+        if len(self.layers) in requested:
+            captures[len(self.layers)] = normalized
+        result = h if skip_final_norm else normalized
+        if capture_layer_ids is not None:
+            return result, [captures[i] for i in capture_layer_ids]
+        return result
 
 
 class LanguageModel(InklingLanguageModel):
@@ -410,6 +521,60 @@ class LanguageModel(InklingLanguageModel):
         self.model = TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.sharding_group = None
+
+    def chunked_prefill_policy(self, **kwargs):
+        # Captures are per-token partial blocks; the shared prefill collector
+        # retains them across chunks. Preserve the caller's target chunk size.
+        return True
+
+    def __call__(
+        self,
+        inputs=None,
+        inputs_embeds=None,
+        cache=None,
+        return_hidden=False,
+        return_shared_kv=False,
+        skip_logits=False,
+        capture_layer_ids=None,
+        speculative_verify=False,
+        **kwargs,
+    ):
+        from ...speculative.cache_state import start_speculative_cache
+
+        transaction = None
+        if speculative_verify:
+            length = inputs.shape[1] if inputs is not None else inputs_embeds.shape[1]
+            transaction = start_speculative_cache(cache, length)
+        try:
+            result = self.model(
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                skip_final_norm=True,
+                capture_layer_ids=capture_layer_ids,
+                speculative_verify=speculative_verify,
+            )
+            pre_norm, captured = (
+                result if capture_layer_ids is not None else (result, None)
+            )
+            return LanguageModelOutput(
+                logits=(
+                    None
+                    if skip_logits
+                    else self._logits_from_norm(self.model.norm(pre_norm))
+                ),
+                hidden_states=(
+                    captured
+                    if capture_layer_ids is not None
+                    else ([pre_norm] if return_hidden else None)
+                ),
+                shared_kv_states={} if return_shared_kv else None,
+                gdn_states=transaction,
+            )
+        except BaseException:
+            if transaction is not None:
+                transaction.abort()
+            raise
 
     def shard(self, group=None):
         group = group or mx.distributed.init()
@@ -484,22 +649,16 @@ class LanguageModel(InklingLanguageModel):
         ]
 
     def speculative_verify_hidden(self, inputs, cache):
-        # Ring-buffer offsets and convolution padding advance with verification;
-        # both belong to the snapshot, in addition to the actual K/V tensors.
-        snapshot = [[_clone_cache_tree(vars(part)) for part in c.caches] for c in cache]
-        mx.eval([a for _, a in tree_flatten(snapshot) if isinstance(a, mx.array)])
-        out = self(inputs, cache=cache, return_hidden=True, skip_logits=True)
-        return out.hidden_states[-1], {}, (snapshot, inputs)
+        out = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            skip_logits=True,
+            speculative_verify=True,
+        )
+        return out.hidden_states[-1], {}, out.gdn_states
 
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        if isinstance(accepted, mx.array):
-            accepted = int(accepted.max().item()) if accepted.size else 0
-        elif not isinstance(accepted, int):
-            accepted = max(map(int, accepted))
-        snapshot, inputs = gdn_states
-        for cache, states in zip(caches, snapshot):
-            for part, state in zip(cache.caches, states):
-                part.__dict__.clear()
-                part.__dict__.update(_clone_cache_tree(state))
-        self(inputs[:, : accepted + 1], cache=caches, skip_logits=True)
-        return accepted
+        from ...speculative.cache_state import rollback_speculative_cache
+
+        return rollback_speculative_cache(caches, gdn_states, accepted, block_size)
