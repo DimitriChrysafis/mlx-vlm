@@ -161,6 +161,34 @@ def test_fast_sync_cannot_be_overridden_by_launch_env(cluster, value):
         ClusterConfig.read(_config_file(cluster, launch=data))
 
 
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_start_fast_sync_override_preserves_configured_default(
+    fake_launch, monkeypatch, configured, override
+):
+    launcher, process, _ = fake_launch
+    launcher.config = replace(
+        launcher.config, launch=replace(launcher.launch, fast_sync=configured)
+    )
+    launcher.launch = launcher.config.launch
+
+    def handler(request):
+        if launcher.process is None:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(
+            200, json=_health(int(request.url.host[-1]), launcher.launch_id)
+        )
+
+    _transport(monkeypatch, handler)
+    asyncio.run(launcher.start(fast_sync=override))
+    expected = configured if override is None else override
+    assert launcher.launch.fast_sync is expected
+    assert launcher.config.launch.fast_sync is configured
+    assert json.loads(process.read())["env"]["MLX_METAL_FAST_SYNCH"] == (
+        "1" if expected else "0"
+    )
+
+
 def _transport(monkeypatch, handler):
     original = httpx.AsyncClient
     monkeypatch.setattr(

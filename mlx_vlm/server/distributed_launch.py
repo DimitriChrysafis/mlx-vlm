@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ._worker_supervisor import worker_environment
@@ -249,9 +249,14 @@ class WorkerLauncher:
             except (OSError, ValueError):
                 return  # Supervisors expire their leases if transport is lost.
 
-    async def start(self, *, recover=False, progress=None):
+    async def start(
+        self, *, recover=False, progress=None, fast_sync: bool | None = None
+    ):
         import httpx
 
+        if fast_sync is not None:
+            # Keep the configured default intact for the next managed launch.
+            self.launch = replace(self.launch, fast_sync=fast_sync)
         started = time.monotonic()
         reported = None
 
@@ -326,8 +331,8 @@ class WorkerLauncher:
             if self.launch.fast_sync:
                 logger.warning(
                     "Experimental distributed fast synchronization is enabled; "
-                    "MLX may deadlock. Disable launch.fast_sync and restart "
-                    "the server and workers if generation stalls."
+                    "MLX may deadlock. Stop the group and relaunch with "
+                    "fast_sync=false if generation stalls."
                 )
             self.process = subprocess.Popen(
                 self._command(),

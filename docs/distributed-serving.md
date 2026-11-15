@@ -175,9 +175,15 @@ It applies both at public-server startup and to cluster API `mode: "launch"`.
 Externally managed workers attached with `mode: "attach"` are unaffected.
 
 MLX [caches this setting on first use](https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/utils.h#L203-L206),
-so changing an environment variable during generation is insufficient. Drain and
-stop the group, update `cluster.json`, and restart the public server to load the
-configuration and launch fresh workers. MLX [warns that fast synchronization can
+so changing an environment variable during generation is insufficient. To change
+it without restarting the public server, drain/stop the group through
+`POST /v1/cluster/stop`, wait for success, then call `POST /v1/cluster/start` with
+`{"mode": "launch", "fast_sync": true}` (or `false`). Include `model` to load a
+checkpoint during startup. The override applies only to that launch; omitting it
+uses the configured `launch.fast_sync` default. `GET /v1/cluster` reports the
+active managed group's `fast_sync` value, or `null` for stopped/external groups.
+Changing the default in `cluster.json` still requires restarting the public server.
+MLX [warns that fast synchronization can
 deadlock and leave the GPU wedged](https://github.com/ml-explore/mlx/blob/main/docs/src/usage/distributed.rst).
 Keep it off unless testing a known workload; a short successful run does not
 establish long-running stability. This option exposes the existing MLX setting;
