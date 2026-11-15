@@ -1026,6 +1026,25 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         with open(model_path / config_file, encoding="utf-8") as f:
             config = json.load(f)
 
+        # Native Mistral releases omit model_type. Resolve their schema before
+        # architecture selection and quantization, using the model's defaults
+        # only for fields the checkpoint does not specify.
+        if (
+            config_file == "params.json"
+            and not {
+                "model_type",
+                "speculators_model_type",
+                "model_file",
+                "text_config",
+            }.intersection(config)
+            and {"dim", "n_layers", "moe", "vision_encoder"}.issubset(config)
+        ):
+            if "dsa" in config:
+                from .models.mistral_large4.config import config_from_params
+            else:
+                from .models.mistral_large3.config import config_from_params
+            config = config_from_params(config)
+
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
             try:

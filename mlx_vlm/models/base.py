@@ -680,6 +680,10 @@ def install_auto_processor_patch(target_model_types, processor_cls):
                 if config_path.exists():
                     with open(config_path, "r", encoding="utf-8") as f:
                         cfg = _json.load(f)
+                elif (model_path / "params.json").is_file():
+                    from ..utils import load_config
+
+                    cfg = load_config(model_path)
             else:
                 try:
                     from huggingface_hub import hf_hub_download

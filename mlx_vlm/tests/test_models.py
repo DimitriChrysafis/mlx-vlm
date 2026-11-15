@@ -1756,7 +1756,9 @@ def test_mistral_large4_owned_experts_match_masked_reference(training, length):
 
 
 @pytest.mark.parametrize("expert_count", [8, 128])
-@pytest.mark.parametrize("config_filename", ["config.json", "params.json"])
+@pytest.mark.parametrize(
+    "config_filename", ["config.json", "params.json", "native_params"]
+)
 def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
     tmp_path, mistral_large4_case, expert_count, config_filename
 ):
@@ -1846,7 +1848,73 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
     }
-    (tmp_path / config_filename).write_text(json.dumps(config))
+    if config_filename == "native_params":
+        text, vision = config["text_config"], config["vision_config"]
+        params = dict(
+            dim=text["hidden_size"],
+            hidden_dim=text["intermediate_size"],
+            n_layers=text["num_hidden_layers"],
+            n_heads=text["num_attention_heads"],
+            n_kv_heads=text["num_key_value_heads"],
+            vocab_size=text["vocab_size"],
+            norm_eps=text["rms_norm_eps"],
+            max_position_embeddings=text["max_position_embeddings"],
+            q_lora_rank=None,
+            kv_lora_rank=text["kv_lora_rank"],
+            qk_rope_head_dim=text["qk_rope_head_dim"],
+            qk_nope_head_dim=text["qk_nope_head_dim"],
+            v_head_dim=text["v_head_dim"],
+            rope_theta=text["rope_parameters"]["rope_theta"],
+            softmax_tanh_gating=text["final_logit_softcapping"],
+            nope=",".join(
+                "rope" if value else "nope" for value in text["no_rope_layers"]
+            ),
+            kv_sharing={
+                "source_layers_str": ",".join(map(str, text["kv_source_layers"]))
+            },
+            dsa=dict(
+                topk=text["index_topk"],
+                head_dim=text["index_head_dim"],
+                n_heads=text["index_n_heads"],
+                sharing=",".join(text["indexer_types"]),
+            ),
+            yarn=dict(
+                factor=text["rope_parameters"]["factor"],
+                original_max_position_embeddings=text["rope_parameters"][
+                    "original_max_position_embeddings"
+                ],
+                beta=text["rope_parameters"]["beta_fast"],
+                alpha=text["rope_parameters"]["beta_slow"],
+            ),
+            moe=dict(
+                expert_hidden_dim=text["moe_intermediate_size"],
+                num_experts=text["n_routed_experts"],
+                num_shared_experts=text["n_shared_experts"],
+                num_experts_per_tok=text["num_experts_per_tok"],
+                first_k_dense_replace=text["first_k_dense_replace"],
+                num_expert_groups=text["n_group"],
+                num_expert_groups_per_tok=text["topk_group"],
+                routed_scale=text["routed_scaling_factor"],
+            ),
+            vision_encoder={
+                **vision,
+                "image_token_id": 10,
+                "spatial_merge_size": config["spatial_merge_size"],
+                "adapter_bias": config["multimodal_projector_bias"],
+            },
+            quantization_config={
+                **config["quantization_config"],
+                "quantized_layers": {"layers.1.experts": {"quant_algo": "NVFP4"}},
+            },
+        )
+        (tmp_path / "params.json").write_text(json.dumps(params))
+        loaded = load_config(tmp_path)
+        assert loaded["model_type"] == "mistral_large4"
+        from mlx_vlm.server.cluster import validate_model
+
+        validate_model(loaded, 3)
+    else:
+        (tmp_path / config_filename).write_text(json.dumps(config))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), native)
     model = load_model(tmp_path)
     if config_filename == "params.json":
@@ -1922,6 +1990,9 @@ def test_mistral_large4_shared_loader_native_weights_and_roundtrip(
             check_partition(rank)
 
     # Native staging uses global expert IDs, including nonzero starting ranks.
+    if config_filename == "native_params":
+        assert json.loads((tmp_path / "params.json").read_text()) == params
+        config_filename = "params.json"
     config["text_config"].update(expert_start=2, expert_end=5)
     (tmp_path / config_filename).write_text(json.dumps(config))
     partition = load_model(tmp_path)
@@ -4097,6 +4168,68 @@ def test_load_config_preserves_params_schema(tmp_path, params):
     assert load_config(tmp_path) == params
     assert not (tmp_path / "config.json").exists()
     assert json.loads((tmp_path / "params.json").read_text()) == params
+
+
+@pytest.mark.parametrize("family", ["mistral_large3", "mistral_large4"])
+def test_load_config_routes_native_mistral(tmp_path, native_mistral_params, family):
+    params = native_mistral_params
+    if family == "mistral_large3":
+        params.pop("dsa")
+    else:
+        params["quantization"] = dict(
+            qformat_weight="fp8_e4m3",
+            qscheme_weight="BLOCK",
+            block_size_out=128,
+            block_size_in=128,
+        )
+    path = tmp_path / "params.json"
+    original = json.dumps(params)
+    path.write_text(original)
+    (tmp_path / "generation_config.json").write_text(json.dumps({"temperature": 0.3}))
+    config = load_config(tmp_path)
+    module, model_type = get_model_and_args(config)
+    assert model_type == family
+    actual = module.TextConfig.from_dict(config["text_config"])
+    assert actual.hidden_size == params["dim"]
+    assert actual.num_hidden_layers == params["n_layers"]
+    assert actual.rms_norm_eps == params["norm_eps"]
+    assert (
+        config["vision_config"]["patch_size"] == params["vision_encoder"]["patch_size"]
+    )
+    if family == "mistral_large4":
+        assert actual.index_head_dim == module.TextConfig().index_head_dim
+        assert actual.index_topk == params["dsa"]["topk"]
+        assert config["quantization_config"]["scale_key"] == "qscale_weight"
+        assert "quantization" not in config
+    assert config["temperature"] == 0.3
+    assert path.read_text() == original
+    assert not (tmp_path / "config.json").exists()
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {"model_type": "other"},
+        {"speculators_model_type": "other"},
+        {"model_file": "custom.py"},
+        {"text_config": {"hidden_size": 16}},
+    ],
+)
+def test_load_config_preserves_explicit_native_declarations(
+    tmp_path, native_mistral_params, declaration
+):
+    params = {**native_mistral_params, **declaration}
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    assert load_config(tmp_path) == params
+
+
+def test_load_config_rejects_incomplete_native_mistral(tmp_path, native_mistral_params):
+    native_mistral_params.pop("hidden_dim")
+    (tmp_path / "params.json").write_text(json.dumps(native_mistral_params))
+    with pytest.raises(
+        ValueError, match="Missing native Mistral Large 4 fields.*hidden_dim"
+    ):
+        load_config(tmp_path)
 
 
 def test_load_config_accepts_standard_schema_params(tmp_path):

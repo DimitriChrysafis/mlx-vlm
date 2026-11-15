@@ -852,11 +852,29 @@ def test_auto_processor_routes_to_custom_loader(
         loader.assert_called_once_with(tmp_path, trust_remote_code=True)
 
 
-def test_mistral_large4_processor_without_torch(tmp_path):
+@pytest.mark.parametrize(
+    "config_filename", ["config.json", "params.json", "native_params"]
+)
+@pytest.mark.parametrize("model_type", ["mistral_large3", "mistral_large4"])
+def test_mistral_large_processor_without_torch(
+    tmp_path, config_filename, native_mistral_params, model_type
+):
     metadata = deepcopy(DATA["checkpoints"]["mistral3"])
-    metadata["config"]["model_type"] = "mistral_large4"
+    metadata["config"]["model_type"] = model_type
     metadata["processor_config"]["processor_class"] = "PixtralProcessor"
+    if config_filename == "params.json":
+        metadata["params"] = metadata.pop("config")
+    elif config_filename == "native_params":
+        metadata.pop("config")
+        metadata["params"] = native_mistral_params
+        if model_type == "mistral_large3":
+            metadata["params"].pop("dsa")
     _write_configs(tmp_path, **metadata)
+    params_before = (
+        (tmp_path / "params.json").read_bytes()
+        if config_filename != "config.json"
+        else None
+    )
     image_tokens = ["[IMG]", "[IMG_BREAK]", "[IMG_END]"]
     fast_tokenizer(
         ("[UNK]", "[PAD]", "hello", *image_tokens),
@@ -884,7 +902,7 @@ def test_mistral_large4_processor_without_torch(tmp_path):
 
         folder = Path(sys.argv[1])
         module, model_type = get_model_and_args(load_config(folder))
-        assert model_type == "mistral_large4"
+        assert model_type == sys.argv[2]
         processor = load_processor(folder, local_files_only=True)
         assert isinstance(processor, module.Mistral3Processor)
         assert type(processor.image_processor).__module__ == "mlx_vlm.models.pixtral.image_processing_pixtral"
@@ -898,12 +916,15 @@ def test_mistral_large4_processor_without_torch(tmp_path):
         assert not any(name.split(".")[0] in blocked for name in sys.modules)
     """)
     result = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)],
+        [sys.executable, "-c", script, str(tmp_path), model_type],
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    if params_before is not None:
+        assert (tmp_path / "params.json").read_bytes() == params_before
+        assert not (tmp_path / "config.json").exists()
 
 
 def test_flint_tokenizer_prompt_and_stop_tokens(tmp_path):

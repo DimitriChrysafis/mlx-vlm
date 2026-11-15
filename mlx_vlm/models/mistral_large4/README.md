@@ -10,13 +10,15 @@ the Pixtral encoder and Mistral projector.
 
 Use a model directory with a standard `config.json` (`model_type: mistral_large4`,
 `text_config`, and `vision_config`), tokenizer/processor files, and safetensors.
-When `config.json` is absent, the shared loader reads `params.json`. Both filenames
-must contain the standard model configuration schema. Normalize native Mistral
-metadata before saving it under either filename. Use standard checkpoint
+When `config.json` is absent, the shared loader reads `params.json`. It accepts
+the standard schema or recognizes native Mistral metadata and normalizes it in
+memory through the model's configuration class. Checkpoint values take precedence;
+config defaults fill omitted optional fields. Use standard checkpoint
 filenames such as `model.safetensors` and compatible tokenizer/processor files.
 
-For a native release containing only `params.json`, create the metadata file once
-before calling `mlx_vlm.load` or starting distributed serving:
+Native releases containing only `params.json` can be passed directly to
+`mlx_vlm.load` or distributed serving. No generated `config.json` is required.
+To export a normalized configuration explicitly for another tool:
 
 ```python
 import json
@@ -31,12 +33,12 @@ with (model_path / "config.json").open("x") as f:
 ```
 
 The model's config post-init hook translates attention, expert routing, shared
-caches, vision, and quantization metadata. This step does not rewrite weights or
-change `params.json`. It preserves an existing `config.json` by refusing to
-overwrite it. The shared loader remains unchanged and requires `model_type`
-before it can select the architecture. NVFP4 and native 128×128 block-FP8 weights
-then use the existing conversion path. `Mistral3Processor.from_pretrained` also
-accepts native metadata directly when used explicitly.
+caches, vision, and quantization metadata. Automatic loading never writes either
+metadata file or rewrites checkpoint weights. An existing `config.json` takes
+precedence, including its parse errors; explicit architecture declarations and
+custom model files are preserved. NVFP4 and native 128×128 block-FP8 weights use
+the existing conversion path. Automatic processor selection, the explicit
+Mistral processor, and cluster preflight use the same normalized configuration.
 
 The model uses MLX-VLM's Mistral processor and NumPy/PIL image preprocessing;
 Torch and Torchvision are not required.

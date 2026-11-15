@@ -20,3 +20,8 @@ This model reuses existing mlx-vlm components rather than reimplementing them:
 ## Checkpoint conversion
 
 The published checkpoint ships Mistral's native format (`params.json` + `tekken.json`, no `config.json`) with block-FP8 weights. `config.config_from_params` maps `params.json` to an mlx-vlm config. Convert the weights to an mlx-vlm 4-bit build (~340 GB) before loading; loading the full 675B model requires a machine with enough memory (a 512 GB Apple silicon machine fits the 4-bit build).
+
+The shared loader recognizes native metadata and calls this mapping in memory
+when `config.json` is absent. It preserves both checkpoint files and explicit
+architecture declarations. Automatic processor selection uses the existing
+Mistral NumPy/PIL processor; Torch and Torchvision are not required.

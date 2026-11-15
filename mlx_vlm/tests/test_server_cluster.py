@@ -628,13 +628,15 @@ async def test_events_replay_and_reset_after_retention_gap(control):
     await response.body_iterator.aclose()
 
 
-@pytest.mark.parametrize("config_file", ["config.json", "params.json"])
+@pytest.mark.parametrize("config_file", ["config.json", "params.json", "native_params"])
 async def test_hub_model_preflight_accepts_both_config_names(
-    control, monkeypatch, tmp_path, config_file
+    control, monkeypatch, tmp_path, config_file, native_mistral_params
 ):
     config = {"model_type": "mistral_large4"}
-    path = tmp_path / config_file
-    path.write_text(json.dumps(config))
+    path = tmp_path / ("params.json" if config_file == "native_params" else config_file)
+    path.write_text(
+        json.dumps(native_mistral_params if config_file == "native_params" else config)
+    )
     download = Mock(
         side_effect=(
             [str(path)]
@@ -660,7 +662,15 @@ async def test_hub_model_preflight_accepts_both_config_names(
     assert all(
         call.kwargs == {"revision": "revision-a"} for call in download.call_args_list
     )
-    validate.assert_called_once_with(config, 2)
+    if config_file == "native_params":
+        validate.assert_called_once()
+        resolved, members = validate.call_args.args
+        assert members == 2
+        assert resolved["model_type"] == "mistral_large4"
+        assert resolved["text_config"]["hidden_size"] == native_mistral_params["dim"]
+        assert not (tmp_path / "config.json").exists()
+    else:
+        validate.assert_called_once_with(config, 2)
 
 
 @pytest.mark.parametrize(

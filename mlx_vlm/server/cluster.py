@@ -550,7 +550,7 @@ class ClusterManager:
                 path = hf_hub_download(model, "config.json", revision=revision)
             except RemoteEntryNotFoundError:
                 path = hf_hub_download(model, "params.json", revision=revision)
-            return json.loads(Path(path).read_text())
+            return load_config(Path(path).parent)
 
         validate_model(await asyncio.to_thread(metadata), len(self.selected))
 
