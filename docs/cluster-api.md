@@ -292,6 +292,8 @@ after local content verification of the source and snapshot. That first check
 reads the weights with bounded parallelism and reports progress; cancellation
 or corruption does not promote the source receipt or start a transfer. Later
 preparations reuse the verified receipts without rereading unchanged weights.
+Completed migration progress reflects the bytes actually verified, excluding
+any snapshot scan skipped by a current receipt.
 
 This cache assumes the server account and its private state are trusted. It is
 not protection against an attacker controlling that same OS account. Checking

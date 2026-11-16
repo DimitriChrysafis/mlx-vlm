@@ -24,6 +24,10 @@ from pathlib import Path
 
 CHUNK_BYTES = 16 * 1024 * 1024
 MANIFEST = ".mlx-vlm-distributed.json"
+# Darwin getattrlist constants from <sys/attr.h>.
+ATTR_BIT_MAP_COUNT = 5
+ATTR_VOL_UUID = 0x00040000
+ATTR_VOL_INFO = 0x80000000
 
 
 def cancelled(stop):
@@ -37,7 +41,16 @@ def _volume_identity(path, device):
     # retain the conservative device-number check (and reverify on a cache miss).
     if sys.platform == "darwin":
         attrs = ctypes.create_string_buffer(
-            struct.pack("=HHIIIII", 5, 0, 0, 0x80040000, 0, 0, 0)
+            struct.pack(
+                "=HHIIIII",
+                ATTR_BIT_MAP_COUNT,
+                0,
+                0,
+                ATTR_VOL_INFO | ATTR_VOL_UUID,
+                0,
+                0,
+                0,
+            )
         )
         result = ctypes.create_string_buffer(20)
         if ctypes.CDLL(None).getattrlist(os.fsencode(path), attrs, result, 20, 0) == 0:
@@ -486,6 +499,8 @@ def prepare_snapshot(
                 for n in inputs
             )
             if not same and legacy:
+                # Allow for source and snapshot scans until receipt validation
+                # establishes whether the latter can be skipped.
                 verification_total *= 2
                 verify_files(
                     {name: (source / name).resolve() for name in inputs},
@@ -505,6 +520,12 @@ def prepare_snapshot(
                         raise ValueError(
                             "Source checkpoint changed during verification"
                         )
+                    if checked_bytes and checked_bytes != verification_total:
+                        # A current snapshot receipt can skip the second scan.
+                        # Complete with measured work, not the two-scan estimate.
+                        verification_total = checked_bytes
+                        checked(0)
+                        cancelled(stop)
                     if cached["inputs"] != inputs:
                         atomic_json(
                             index, {"inputs": inputs, "manifest": cached["manifest"]}

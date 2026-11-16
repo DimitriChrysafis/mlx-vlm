@@ -1043,6 +1043,73 @@ def test_volume_uuid_survives_mount_number_change(snapshot, monkeypatch):
     assert store.prepare_snapshot(source, names, root, chunk=1024) == (final, manifest)
 
 
+@pytest.mark.parametrize(
+    "legacy_receipts,cancel_at_completion",
+    [
+        ((), False),
+        (("inputs",), False),
+        (("signature",), False),
+        (("inputs", "signature"), False),
+        (("inputs",), True),
+    ],
+)
+def test_migration_progress_finishes_with_actual_verified_bytes(
+    snapshot, monkeypatch, legacy_receipts, cancel_at_completion
+):
+    source, names, root, final, manifest = snapshot
+    for path in (root / ".verified").glob("*.json"):
+        receipt = json.loads(path.read_text())
+        for key in legacy_receipts:
+            for signature in receipt.get(key, {}).values():
+                signature[0] = 1234
+        path.write_text(json.dumps(receipt))
+
+    verify = Mock(wraps=store.verify_chunks)
+    monkeypatch.setattr(store, "verify_chunks", verify)
+    stream = Mock(side_effect=AssertionError("Unexpected transfer"))
+    events = []
+    stop = threading.Event()
+
+    def progress(**data):
+        events.append(data)
+        if cancel_at_completion and data["bytes_verified"] == data["total_bytes"]:
+            stop.set()
+
+    def prepare():
+        return store.prepare_snapshot(
+            source,
+            names,
+            root,
+            chunk=1024,
+            stream=stream,
+            progress=progress,
+            stop=stop,
+        )
+
+    if cancel_at_completion:
+        receipts = {
+            path: path.read_bytes() for path in (root / ".verified").glob("*.json")
+        }
+        with pytest.raises(InterruptedError):
+            prepare()
+        assert all(path.read_bytes() == saved for path, saved in receipts.items())
+    else:
+        assert prepare() == (final, manifest)
+    stream.assert_not_called()
+    assert verify.call_count == len(names) * len(legacy_receipts)
+    if legacy_receipts:
+        expected = sum(record["size"] for record in manifest["files"].values())
+        expected *= len(legacy_receipts)
+        assert events[-1] == dict(
+            bytes_read=expected, bytes_verified=expected, total_bytes=expected
+        )
+        assert [event["bytes_verified"] for event in events] == sorted(
+            event["bytes_verified"] for event in events
+        )
+    else:
+        assert events == []
+
+
 @pytest.mark.parametrize("failure", [None, "source", "snapshot", "cancel"])
 def test_legacy_mount_receipts_revalidate_before_streaming(
     snapshot, monkeypatch, failure
