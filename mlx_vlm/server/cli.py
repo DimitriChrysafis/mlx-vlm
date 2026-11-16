@@ -153,7 +153,7 @@ def main():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE),
         help="Prompt-token budget per batch step, including padding "
         "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
@@ -370,7 +370,7 @@ def main():
             )
         ):
             parser.error(
-                "Distributed workers load coordinator-staged models on demand; preloads, adapters and drafters are unsupported"
+                "Distributed workers load coordinator-staged models on demand; configure drafts through /v1/cluster/start instead of worker CLI flags"
             )
         if any(
             name.startswith("MLX_VLM_PRELOAD_") for name in os.environ

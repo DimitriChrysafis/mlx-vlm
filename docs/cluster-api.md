@@ -371,6 +371,23 @@ hostfile/topology requires reconfiguration while stopped. It does not synthesize
 RDMA wiring from IP addresses. Topology is ultimately validated by initializing
 the configured MLX backend and successfully running collectives, not discovery.
 
+Managed launches honor the experimental, default-off `launch.fast_sync` boolean
+in `cluster.json`. To override it without restarting the public server, first
+stop the group and wait for that operation to succeed, then start fresh workers:
+
+```json
+{"mode": "launch", "fast_sync": true, "model": "organization/shardable-model"}
+```
+
+`fast_sync` accepts only a boolean or `null`; omitting it (or using `null`) inherits
+the configured default. The override applies only to this launch and does not
+change the default for future starts. Use `false` to disable it. A start request
+while the group is running still fails with `already_running`; `mode: "attach"`
+rejects a non-null `fast_sync` because external workers are already initialized.
+`GET /v1/cluster` exposes the active managed group's effective `fast_sync`, or
+`null` when stopped or attached externally. See [distributed launch configuration](distributed-serving.md)
+for MLX's deadlock warning. All workers receive the setting before Python starts.
+
 `stop` first rejects new distributed admissions, then waits for active requests
 to drain, up to `drain_timeout_seconds` (default 60). A timeout is observable and
 never silently kills active inference. Retained continuations return
@@ -393,6 +410,48 @@ affected collective, then start/attach again. Recovery checks fresh process
 instance IDs before clearing the failure marker; a healthy HTTP endpoint alone
 does not prove a broken collective recovered. Restarting the coordinator keeps
 registrations/selection but requires explicit reattachment to external workers.
+
+## Speculative decoding
+
+Configure a draft when starting a stopped group. Use the target model ID again
+for a bundled head such as Inkling 2's DSpark, or specify a separate draft
+checkpoint:
+
+```json
+{
+  "mode": "launch",
+  "model": "thinkingmachines/Inkling-2-Small",
+  "draft": {
+    "model": "thinkingmachines/Inkling-2-Small",
+    "block_size": 3
+  }
+}
+```
+
+Send this body to `POST /v1/cluster/start`, wait for its operation to succeed,
+then use the normal Responses or Chat Completions routes with `distributed: true`.
+`draft.kind` is optional (`dflash` or `mtp`); the loader detects bundled DSpark
+heads as `dflash`. `draft.revision` pins a separate Hub draft; a bundled draft inherits the target
+revision unless explicitly overridden. Omit `block_size`
+to use the draft's default; an explicit value must be at least two.
+
+The coordinator delivers and verifies both checkpoints before loading. A bundled
+draft reuses the target snapshot. Draft weights are replicated on each worker;
+the target keeps its distributed partition. Workers never download drafts or
+inherit the public server's draft settings. Incompatible drafts fail the load
+across the group instead of silently falling back to ordinary decoding.
+
+Streaming, continuous batching, cancellation, and retained continuation use the
+native speculative generator. Timings include `draft_kind`, `draft_rounds`,
+`draft_n`, and `draft_n_accepted`. `GET /v1/cluster` reports the selected `draft`
+and the workers' supported `capabilities.speculative_drafters`. EAGLE-3 is not
+supported on this path.
+
+The draft is bound to the target model and revision selected at start. Drain and
+stop the group before changing either checkpoint or block size. Start without
+`draft` to disable speculation; retained continuations must first be finished,
+expired, or explicitly disposed through the existing stop contract. Requests for
+another target return `draft_target_mismatch`.
 
 ## Continuations, progress, and capabilities
 

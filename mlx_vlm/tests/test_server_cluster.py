@@ -114,6 +114,103 @@ async def register_pair(control):
     await control.select(Members(node_ids=["a", "b"]))
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"mode": "launch", "fast_sync": 1},
+        {"mode": "launch", "fast_sync": 0},
+        {"mode": "launch", "fast_sync": "true"},
+        {"mode": "launch", "fast_sync": "false"},
+        {"mode": "attach", "fast_sync": True},
+        {"mode": "attach", "fast_sync": False},
+    ],
+)
+def test_start_api_rejects_invalid_or_external_fast_sync(control, body):
+    client = TestClient(server.app)
+    response = client.post(
+        "/v1/cluster/start",
+        headers={"Authorization": "Bearer public-secret"},
+        json=body,
+    )
+    assert response.status_code == 422
+    assert not control.operations and not control.tasks
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_start_api_toggles_fast_sync_without_changing_default(
+    control, monkeypatch, configured
+):
+    from dataclasses import replace
+
+    from mlx_vlm.server.distributed_launch import LaunchConfig
+
+    await register_pair(control)
+    initial = management.Coordinator(
+        replace(
+            control.config(),
+            launch=LaunchConfig(
+                control.root / "hosts.json", str(control.root), fast_sync=configured
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime, "distributed_coordinator", initial)
+    control.bootstrapped = True
+    start = AsyncMock()
+    monkeypatch.setattr(WorkerLauncher, "start", start)
+    monkeypatch.setattr(WorkerLauncher, "_stop", Mock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    for override in (True, False, None):
+        body = StartGroup(mode="launch", fast_sync=override)
+        operation = await control.begin("start", body, f"start-{override}")
+        await asyncio.gather(*control.tasks)
+        assert operation.status == "succeeded", operation.error
+        assert start.call_args.kwargs["fast_sync"] is override
+        assert runtime.distributed_coordinator.config.launch.fast_sync is configured
+        active = runtime.distributed_coordinator
+        calls = start.await_count
+        repeated = await control.begin("start", body, f"start-{override}")
+        assert repeated.id == operation.id and start.await_count == calls
+        rejected = await control.begin(
+            "start", StartGroup(mode="launch", fast_sync=not override), None
+        )
+        await asyncio.gather(*control.tasks)
+        assert rejected.error.code == "already_running"
+        assert runtime.distributed_coordinator is active
+        assert start.await_count == calls
+        stopped = await control.begin("stop", StopGroup(), None)
+        await asyncio.gather(*control.tasks)
+        assert stopped.status == "succeeded", stopped.error
+        assert control.snapshot().fast_sync is None
+    assert initial.config.launch.fast_sync is configured
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_cluster_state_reports_effective_fast_sync(control, monkeypatch, configured):
+    from dataclasses import replace
+
+    from mlx_vlm.server.distributed_launch import LaunchConfig
+
+    coordinator = management.Coordinator(
+        replace(
+            control.config(),
+            launch=LaunchConfig(
+                control.root / "hosts.json", str(control.root), fast_sync=configured
+            ),
+        )
+    )
+    monkeypatch.setattr(runtime, "distributed_coordinator", coordinator)
+    control.nodes["a"] = NS(identity=info("a"))
+    control.running = ["a"]
+    assert control.snapshot().fast_sync is None  # Externally managed group.
+    coordinator.launcher = WorkerLauncher(coordinator)
+    coordinator.launcher.launch = replace(
+        coordinator.config.launch, fast_sync=not configured
+    )
+    assert control.snapshot().fast_sync is not configured
+    control.running = []
+    assert control.snapshot().fast_sync is None
+
+
 async def test_authenticated_identity_preserving_updates_and_persistence(control):
     await register_pair(control)
     node = await control.update(
@@ -703,6 +800,23 @@ def test_model_member_count_errors_are_actionable(monkeypatch):
     assert error.value.detail["action"]
 
 
+@pytest.mark.parametrize("world_size", [2, 3, 5, 32])
+def test_inkling2_member_count_uses_expert_ownership(world_size):
+    config = {
+        "model_type": "inkling2",
+        "text_config": {
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "n_routed_experts": 32,
+        },
+    }
+    management.validate_model(config, world_size)
+    with pytest.raises(HTTPException) as error:
+        management.validate_model(config, 33)
+    assert error.value.detail["code"] == "unsupported_member_count"
+
+
 async def test_weight_delivery_operation_is_independent_of_membership(
     control, monkeypatch
 ):
@@ -1017,3 +1131,89 @@ async def test_failed_group_can_stop_without_contacting_dead_session_endpoints(
     assert not control.running and control.state == "stopped"
     assert operation.result["collective_disposal_acknowledged"] is False
     assert operation.result["external_restart_required"] is False
+
+
+@pytest.mark.parametrize("bundle", [False, True])
+async def test_start_stages_and_reports_speculative_draft(
+    control, monkeypatch, tmp_path, bundle
+):
+    from mlx_vlm.server.cluster_types import SpeculativeDraft
+
+    await register_pair(control)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text('{"model_type": "inkling2_dspark"}')
+    stage = AsyncMock(return_value=str(snapshot))
+    monkeypatch.setattr(control, "stage_model", stage)
+    monkeypatch.setattr(control, "load_model", AsyncMock(return_value=({}, 200)))
+    draft = SpeculativeDraft(
+        model="org/target" if bundle else "org/draft", block_size=3
+    )
+    operation = await control.begin(
+        "start", StartGroup(model="org/target", draft=draft), None
+    )
+    await asyncio.gather(*control.tasks)
+    assert operation.status == "succeeded", operation.error
+    assert stage.await_count == (1 if bundle else 2)
+    if not bundle:
+        assert stage.call_args.args[2:4] == ("org/draft", None)
+        assert stage.call_args.kwargs == {"validate_sharding": False}
+    coordinator = runtime.distributed_coordinator
+    assert coordinator.draft_target == ("org/target", None)
+    assert coordinator.draft_path == str(snapshot)
+    assert control.snapshot().draft == draft.model_copy(update={"kind": "dflash"})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"draft": {"model": "org/draft"}},
+        {"model": "org/target", "draft": {"model": "org/draft", "block_size": 1}},
+        {"model": "org/target", "draft": {"model": "org/draft", "kind": "eagle3"}},
+    ],
+)
+def test_start_rejects_invalid_speculative_configuration(body):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        StartGroup.model_validate(body)
+
+
+def test_bundled_draft_inherits_pinned_target_revision():
+    body = StartGroup.model_validate(
+        {"model": "org/target", "revision": "pinned", "draft": {"model": "org/target"}}
+    )
+    assert body.draft.revision == "pinned"
+    explicit = StartGroup.model_validate(
+        {
+            "model": "org/target",
+            "revision": "pinned",
+            "draft": {"model": "org/target", "revision": "different"},
+        }
+    )
+    assert explicit.draft.revision == "different"
+
+
+async def test_auto_detected_unsupported_draft_never_loads_workers(
+    control, monkeypatch, tmp_path
+):
+    await register_pair(control)
+    monkeypatch.setattr(control, "check_model", AsyncMock())
+    monkeypatch.setattr(management.Coordinator, "_health", AsyncMock())
+    (tmp_path / "config.json").write_text('{"model_type": "eagle3"}')
+    monkeypatch.setattr(control, "stage_model", AsyncMock(return_value=str(tmp_path)))
+    load = AsyncMock()
+    monkeypatch.setattr(control, "load_model", load)
+    operation = await control.begin(
+        "start",
+        StartGroup.model_validate(
+            {"model": "org/target", "draft": {"model": "org/draft"}}
+        ),
+        None,
+    )
+    await asyncio.gather(*control.tasks)
+    assert operation.status == "failed" and operation.error.code == "unsupported_draft"
+    load.assert_not_called()
+    assert runtime.distributed_coordinator is None
