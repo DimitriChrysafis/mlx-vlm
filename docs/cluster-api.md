@@ -548,5 +548,4 @@ Authentication/validation errors also retain standard FastAPI status semantics.
 
 Applications still own discovery, pairing/consent, device UI, and their own
 external process supervision. SSH trust/access and backend/network preparation
-remain deployment responsibilities. No Nativ fields or native onboarding code
-are part of MLX-VLM.
+remain deployment responsibilities.
