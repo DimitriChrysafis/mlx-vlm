@@ -318,10 +318,9 @@ are immutable and are not automatically deleted. Unchanged, sealed snapshots reu
 verification receipts without rereading weights. A fresh snapshot still requires
 whole-file and chunk verification; Hugging Face does not supply chunk checksums.
 On macOS, persistent volume UUIDs keep those receipts valid across reboots when
-the file metadata is unchanged. Older receipts may need one local verification
-pass before reuse; this reports progress and can be cancelled without restarting
-the transfer. See [checkpoint cache integrity](cluster-api.md#rdma-delivery-and-verified-snapshot-reuse)
-for receipt migration and interrupted-transfer recovery.
+the file metadata is unchanged. Old device-number receipts follow the normal
+cache-miss path; no migration or search for partials under old transaction IDs
+is performed.
 For the first RDMA peer, verification uses the same source buffers as transmission,
 removing the separate preparatory read. APFS copy-on-write clones isolate the
 source without copying its contents; other filesystems require a bounded private

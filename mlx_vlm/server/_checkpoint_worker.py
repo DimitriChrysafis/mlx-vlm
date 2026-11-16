@@ -671,47 +671,12 @@ def main():
                             partial_hashes=partial_hashes(partial, layout, report),
                         )
                         continue
-                    checked = [0]
-
-                    def checking_cache(count):
-                        checked[0] += count
-                        report(bytes_checked=checked[0])
-
-                    final = current.existing(manifest, progress=checking_cache)
+                    final = current.existing(manifest)
                     if final:
                         lock.close()
                         lock = None
                         result = {"ready": True, "path": str(final)}
                     else:
-                        # A mount-number change can leave a legacy transaction
-                        # under another ID. Keep its bytes in place and reuse only
-                        # chunks verified against the current source manifest.
-                        preferred = current.root / (
-                            ".partial-"
-                            + (
-                                "pipeline-" + current.partial_id
-                                if current.partial_id
-                                else store.snapshot_id(manifest)
-                            )
-                        )
-                        if not preferred.exists():
-                            for identity in current.resume_candidates(manifest):
-                                candidate_lock = (
-                                    current.receipts / (identity + ".lock")
-                                ).open("a")
-                                try:
-                                    fcntl.flock(
-                                        candidate_lock, fcntl.LOCK_EX | fcntl.LOCK_NB
-                                    )
-                                except BlockingIOError:
-                                    candidate_lock.close()
-                                    continue
-                                lock.close()
-                                lock = candidate_lock
-                                current = store.SnapshotStore(
-                                    command["root"], partial_id=identity
-                                )
-                                break
                         current.writable_partial(manifest)
                         result = check_partial(current, manifest, report)
                 elif op in {"send_stream", "receive_stream"}:
