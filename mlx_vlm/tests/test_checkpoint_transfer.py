@@ -7,6 +7,7 @@ import io
 import json
 import os
 import queue
+import struct
 import sys
 import threading
 from pathlib import Path
@@ -975,3 +976,188 @@ def test_stream_hashes_each_source_byte_once_and_verifies_receiver(
             events[-1]["bytes_received"] + events[-1]["bytes_reused"]
             == events[-1]["bytes_verified"]
         )
+
+
+@pytest.mark.parametrize(
+    "platform,result,length,volume",
+    [
+        ("darwin", 0, 20, bytes(range(16))),
+        ("darwin", -1, 20, bytes(range(16))),
+        ("darwin", 0, 4, bytes(range(16))),
+        ("darwin", 0, 20, bytes(16)),
+        ("linux", 0, 20, bytes(range(16))),
+    ],
+)
+def test_volume_identity_falls_back_when_uuid_is_unavailable(
+    monkeypatch, platform, result, length, volume
+):
+    def getattrlist(path, attrs, output, size, options):
+        payload = struct.pack("=I", length) + volume
+        ctypes.memmove(output, payload, len(payload))
+        return result
+
+    call = Mock(side_effect=getattrlist)
+    monkeypatch.setattr(store, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(
+        store.ctypes, "CDLL", lambda *args: SimpleNamespace(getattrlist=call)
+    )
+    expected = (
+        "volume-uuid:" + volume.hex()
+        if platform == "darwin" and result == 0 and length == 20 and any(volume)
+        else 1234
+    )
+    assert store._volume_identity("/checkpoint", 1234) == expected
+    assert call.call_count == (1 if platform == "darwin" else 0)
+
+
+def test_volume_uuid_survives_mount_number_change(snapshot, monkeypatch):
+    source, names, root, final, manifest = snapshot
+    original = store._volume_identity
+    if not isinstance(original(source, source.stat().st_dev), str):
+        pytest.skip("Persistent volume identity is Darwin-specific")
+    real_stat = Path.lstat
+
+    def remounted(path):
+        s = real_stat(path)
+        return SimpleNamespace(
+            **{
+                k: getattr(s, k)
+                for k in [
+                    "st_mode",
+                    "st_ino",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                    "st_uid",
+                ]
+            },
+            st_dev=s.st_dev + 100,
+        )
+
+    monkeypatch.setattr(Path, "lstat", remounted)
+    monkeypatch.setattr(
+        store,
+        "verify_chunks",
+        Mock(side_effect=AssertionError("Must reuse the persistent receipt")),
+    )
+    assert store.prepare_snapshot(source, names, root, chunk=1024) == (final, manifest)
+
+
+@pytest.mark.parametrize("failure", [None, "source", "snapshot", "cancel"])
+def test_legacy_mount_receipts_revalidate_before_streaming(
+    snapshot, monkeypatch, failure
+):
+    source, names, root, final, manifest = snapshot
+    # Reproduce receipts from before reboot and before persistent volume IDs.
+    for path in (root / ".verified").glob("*.json"):
+        value = json.loads(path.read_text())
+        signatures = value.get("inputs", value.get("signature", {}))
+        for sig in signatures.values():
+            sig[0] = 1234
+        path.write_text(json.dumps(value))
+    if failure in ("source", "snapshot"):
+        target = (source if failure == "source" else final) / "weights.safetensors"
+        target.chmod(0o644)
+        target.write_bytes(b"X" * target.stat().st_size)
+        if failure == "snapshot":
+            target.chmod(0o444)
+        # Simulate matching legacy non-device metadata, forcing content validation.
+        for path in (root / ".verified").glob("*.json"):
+            value = json.loads(path.read_text())
+            for key in ("inputs", "signature"):
+                if key in value and "weights.safetensors" in value[key]:
+                    base = source if key == "inputs" else final
+                    value[key]["weights.safetensors"] = [
+                        1234,
+                        *store.signature(base / "weights.safetensors")[1:],
+                    ]
+            path.write_text(json.dumps(value))
+    stop = threading.Event()
+    events = []
+
+    receipts = {path: path.read_bytes() for path in (root / ".verified").glob("*.json")}
+
+    def progress(**data):
+        events.append(data)
+        if failure == "cancel":
+            stop.set()
+
+    stream = Mock(side_effect=AssertionError("Do not resend unchanged legacy weights"))
+    if failure:
+        with pytest.raises(InterruptedError if failure == "cancel" else ValueError):
+            store.prepare_snapshot(
+                source,
+                names,
+                root,
+                chunk=1024,
+                stream=stream,
+                stop=stop,
+                progress=progress,
+            )
+    else:
+        assert store.prepare_snapshot(
+            source, names, root, chunk=1024, stream=stream, progress=progress
+        ) == (final, manifest)
+        assert events and events[-1]["bytes_verified"] > 0
+        monkeypatch.setattr(
+            store,
+            "verify_chunks",
+            Mock(side_effect=AssertionError("Migration must be one-time")),
+        )
+        assert store.prepare_snapshot(
+            source, names, root, chunk=1024, stream=stream
+        ) == (final, manifest)
+    stream.assert_not_called()
+    if failure:
+        assert all(path.read_bytes() == saved for path, saved in receipts.items())
+
+
+def test_parallel_verification_rechecks_previously_verified_files(
+    snapshot, monkeypatch
+):
+    source, names, _, _, manifest = snapshot
+    verified_config = threading.Event()
+    original = store.verify_chunks
+
+    def verify(path, *args, **kwargs):
+        original(path, *args, **kwargs)
+        if path.name == "config.json":
+            verified_config.set()
+        else:
+            assert verified_config.wait(5)
+            (source / "config.json").write_text("[]")
+
+    monkeypatch.setattr(store, "verify_chunks", verify)
+    with pytest.raises(ValueError, match="changed during verification"):
+        store.verify_files({name: source / name for name in names}, manifest)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_changed_pipeline_id_resumes_verified_chunks_without_copy(
+    snapshot, tmp_path, locked
+):
+    import fcntl
+
+    _, _, _, final, manifest = snapshot
+    destination = store.SnapshotStore(tmp_path / "receiver", partial_id="a" * 64)
+    partial = destination.partial(manifest)
+    (partial / "config.json").write_bytes((final / "config.json").read_bytes())
+    (partial / "weights.safetensors").write_bytes(b"bad" * 100)
+    lock = (destination.receipts / ("a" * 64 + ".lock")).open("a")
+    if locked:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    helper = Helper([sys.executable, "-u", "-c", bootstrap()], timeout=5)
+    try:
+        state = helper.call(
+            "begin", root=str(destination.root), manifest=manifest, partial_id="b" * 64
+        )
+        assert (state["path"] == str(partial)) is not locked
+        assert state["bytes_reused"] == (
+            0 if locked else manifest["files"]["config.json"]["size"]
+        )
+        assert len(state["missing"]["weights.safetensors"]) == len(
+            manifest["files"]["weights.safetensors"]["chunks"]
+        )
+    finally:
+        helper.close()
+        lock.close()

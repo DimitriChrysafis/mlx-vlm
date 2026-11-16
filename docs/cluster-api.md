@@ -278,11 +278,20 @@ clones when available. An unsupported clone operation or a cross-filesystem
 source uses a streamed copy; permission, disk-space and other filesystem errors
 fail preparation immediately. It computes whole-file SHA-256 and ordered 16 MiB chunk
 digests during the same initial read, then persists a verified manifest. Files
-and directories are made read-only. A receipt records device/inode identity,
+and directories are made read-only. A receipt records volume/inode identity,
 size, nanosecond modification/change times and modes for the entire snapshot.
 Reuse requires that receipt and the sealed tree to match. A changed tree is
 reverified; corruption fails rather than overwriting the published snapshot.
 Original source files are never chmod'ed or hard-linked into this cache.
+
+On macOS, volume identity uses the filesystem UUID when available, so a changed
+mount-local device number after reboot does not invalidate unchanged weights.
+Other platforms and filesystems without a volume UUID retain device-number
+checks. Legacy receipts with matching non-device metadata are migrated only
+after local content verification of the source and snapshot. That first check
+reads the weights with bounded parallelism and reports progress; cancellation
+or corruption does not promote the source receipt or start a transfer. Later
+preparations reuse the verified receipts without rereading unchanged weights.
 
 This cache assumes the server account and its private state are trusted. It is
 not protection against an attacker controlling that same OS account. Checking
@@ -302,6 +311,11 @@ helper processes do not. Preparation and subsequent inference staging share
 the same snapshot store and verification receipts, including when switching
 between RDMA and SSH/rsync. Snapshots from the former whole-file staging format
 remain intact and loadable; a new preparation creates the chunk manifest once.
+When a complete manifest is available, preparation can also recover an old
+pipeline partial whose transaction ID changed after a remount. Candidate names
+and sizes are only a filter: the receiver acquires the original transaction's
+lock and verifies each chunk against the current manifest before reuse. Active
+transactions are skipped and invalid or missing chunks are transferred again.
 
 Progress uses the existing operation/events endpoints:
 
@@ -313,7 +327,7 @@ Progress uses the existing operation/events endpoints:
 | `bytes_verified` | Verified received chunks plus verified reused chunks |
 | `bytes_reused` | Valid bytes already present at the destination |
 | `bytes_transferred`, `total_bytes` | Delivered logical payload and manifest total |
-| `bytes_checked` | Bytes inspected while validating a partial file, including invalid chunks |
+| `bytes_checked` | Bytes inspected while revalidating a cached snapshot or partial file, including invalid chunks |
 | `elapsed_seconds`, `throughput_bytes_per_second` | Measured attempt time and logical transfer progress/time |
 | `rate_kind` | `logical_payload` for RDMA, `logical_copy_progress` for rsync; neither is a wire-traffic counter |
 

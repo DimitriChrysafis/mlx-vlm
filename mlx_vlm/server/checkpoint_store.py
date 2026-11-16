@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 import threading
 import uuid
@@ -30,11 +31,35 @@ def cancelled(stop):
         raise InterruptedError("Checkpoint preparation cancelled")
 
 
+def _volume_identity(path, device):
+    # Darwin assigns st_dev at mount time; it is not a persistent volume ID.
+    # getattrlist's ATTR_VOL_UUID is stable across reboots. Unsupported filesystems
+    # retain the conservative device-number check (and reverify on a cache miss).
+    if sys.platform == "darwin":
+        attrs = ctypes.create_string_buffer(
+            struct.pack("=HHIIIII", 5, 0, 0, 0x80040000, 0, 0, 0)
+        )
+        result = ctypes.create_string_buffer(20)
+        if ctypes.CDLL(None).getattrlist(os.fsencode(path), attrs, result, 20, 0) == 0:
+            length = struct.unpack_from("=I", result.raw)[0]
+            volume = result.raw[4:20]
+            if length == 20 and any(volume):
+                return "volume-uuid:" + volume.hex()
+    return device
+
+
 def signature(path):
     s = Path(path).lstat()
     if stat.S_ISLNK(s.st_mode):
         raise ValueError("Snapshot symlinks are not permitted")
-    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode]
+    return [
+        _volume_identity(path, s.st_dev),
+        s.st_ino,
+        s.st_size,
+        s.st_mtime_ns,
+        s.st_ctime_ns,
+        s.st_mode,
+    ]
 
 
 def safe_path(root, name):
@@ -180,6 +205,43 @@ def verify_chunks(path, record, chunk, *, stop=None, progress=None):
         raise ValueError("Checkpoint changed during verification")
 
 
+def verify_files(paths, manifest, *, stop=None, progress=None):
+    """Bounded parallel verification, including changes to already checked files."""
+    before = {name: signature(path) for name, path in paths.items()}
+    failed, lock = threading.Event(), threading.Lock()
+
+    def checked(count):
+        cancelled(stop)
+        cancelled(failed)
+        if progress:
+            with lock:
+                progress(count)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(
+                verify_chunks,
+                path,
+                manifest["files"][name],
+                manifest["chunk_bytes"],
+                stop=stop,
+                progress=checked,
+            )
+            for name, path in paths.items()
+        ]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        except BaseException:
+            failed.set()
+            for future in futures:
+                future.cancel()
+            raise
+    cancelled(stop)
+    if any(signature(path) != before[name] for name, path in paths.items()):
+        raise ValueError("Checkpoint changed during verification")
+
+
 class SnapshotStore:
     def __init__(self, root, *, partial_id=None):
         self.root = private_directory(root)
@@ -205,15 +267,12 @@ class SnapshotStore:
         except (OSError, ValueError, KeyError):
             pass
         # Changed, unsealed or legacy cache: never trust its old receipt.
-        for name, record in manifest["files"].items():
-            cancelled(stop)
-            verify_chunks(
-                safe_path(final, name),
-                record,
-                manifest["chunk_bytes"],
-                stop=stop,
-                progress=progress,
-            )
+        verify_files(
+            {name: safe_path(final, name) for name in manifest["files"]},
+            manifest,
+            stop=stop,
+            progress=progress,
+        )
         allowed = set(manifest["files"]) | {MANIFEST}
         if any(
             p.is_file() and p.relative_to(final).as_posix() not in allowed
@@ -253,6 +312,39 @@ class SnapshotStore:
                 raise ValueError("Non-regular checkpoint entry")
             child.chmod(0o700 if child.is_dir() else 0o600)
         return path
+
+    def resume_candidates(self, manifest):
+        """Find legacy pipeline transactions; callers must lock and hash before reuse.
+
+        Transaction IDs used to include st_dev, so a reboot can orphan a valid
+        partial. Names and sizes only select candidates, never establish trust.
+        """
+        candidates = []
+        for path in self.root.glob(".partial-pipeline-*"):
+            identity = path.name.removeprefix(".partial-pipeline-")
+            if identity == self.partial_id or not re.fullmatch(
+                r"[a-f0-9]{64}", identity
+            ):
+                continue
+            if path.is_symlink() or not path.is_dir():
+                continue
+            files, size = {}, 0
+            for item in path.rglob("*"):
+                if item.is_symlink():
+                    break
+                value = signature(item)
+                if stat.S_ISREG(value[-1]):
+                    files[item.relative_to(path).as_posix()] = value[2]
+                    size += value[2]
+                elif not stat.S_ISDIR(value[-1]):
+                    break
+            else:
+                if files and all(
+                    n in manifest["files"] and s <= manifest["files"][n]["size"]
+                    for n, s in files.items()
+                ):
+                    candidates.append((size, identity))
+        return [identity for _, identity in sorted(candidates, reverse=True)]
 
     def missing(self, manifest, *, stop=None, progress=None):
         """Resume checks actual partial bytes; a persisted bitmap alone is unsafe."""
@@ -361,19 +453,63 @@ def prepare_snapshot(
     expected = {n: _hub_sha256((source / n).resolve()) for n in names}
     key = hashlib.sha256(str(source).encode()).hexdigest()
     index = store.receipts / ("source-" + key + ".json")
+    checked_bytes = 0
+    verification_total = sum(s[2] for s in inputs.values())
+
+    def checked(count):
+        nonlocal checked_bytes
+        checked_bytes += count
+        if progress:
+            progress(
+                bytes_read=checked_bytes,
+                bytes_verified=checked_bytes,
+                total_bytes=verification_total,
+            )
+
     try:
         cached = json.loads(index.read_text())
         if (
-            cached["inputs"] == inputs
-            and cached["manifest"]["chunk_bytes"] == chunk
+            cached["manifest"]["chunk_bytes"] == chunk
+            and set(cached["manifest"]["files"]) == set(inputs)
             and all(
                 not h or cached["manifest"]["files"][n]["sha256"] == h
                 for n, h in expected.items()
             )
         ):
-            final = store.existing(cached["manifest"], stop=stop)
-            if final:
-                return final, cached["manifest"]
+            same = cached["inputs"] == inputs
+            # Old receipts have only a mount-local device number. If all other
+            # metadata agrees, verify locally before opening a streaming transfer.
+            # Never promote a legacy receipt based on metadata alone.
+            legacy = set(cached["inputs"]) == set(inputs) and all(
+                isinstance(cached["inputs"][n][0], int)
+                and cached["inputs"][n][1:] == inputs[n][1:]
+                for n in inputs
+            )
+            if not same and legacy:
+                verification_total *= 2
+                verify_files(
+                    {name: (source / name).resolve() for name in inputs},
+                    cached["manifest"],
+                    stop=stop,
+                    progress=checked,
+                )
+                if any(signature((source / n).resolve()) != inputs[n] for n in inputs):
+                    raise ValueError("Source checkpoint changed during verification")
+                same = True
+            if same:
+                final = store.existing(cached["manifest"], stop=stop, progress=checked)
+                if final:
+                    if any(
+                        signature((source / n).resolve()) != inputs[n] for n in inputs
+                    ):
+                        raise ValueError(
+                            "Source checkpoint changed during verification"
+                        )
+                    if cached["inputs"] != inputs:
+                        atomic_json(
+                            index, {"inputs": inputs, "manifest": cached["manifest"]}
+                        )
+                    return final, cached["manifest"]
     except (FileNotFoundError, KeyError, json.JSONDecodeError):
         pass
     temporary = private_directory(store.root / (".building-" + uuid.uuid4().hex))
@@ -492,7 +628,7 @@ def prepare_snapshot(
             raise ValueError("Source checkpoint changed during preparation")
         if any(signature(temporary / n) != verified_signatures[n] for n in names):
             raise ValueError("Prepared checkpoint changed before publication")
-        final = store.existing(manifest, stop=stop)
+        final = store.existing(manifest, stop=stop, progress=checked)
         if final is None:
             partial = store.root / (".partial-" + snapshot_id(manifest))
             if partial.exists():
