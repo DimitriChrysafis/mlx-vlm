@@ -33,11 +33,17 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 
 from mlx_vlm import embedding_loader
 from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
-from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -47,6 +53,7 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
+    save_weights,
     sharded_load,
 )
 
@@ -1534,6 +1541,264 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+@pytest.fixture
+def sensenova_loop_case():
+    case = model_case("sensenova_loop")
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return module, build_config(module, case["config"])
+
+
+def _sensenova_loop_model(case):
+    module, config = case
+    mx.random.seed(17)
+    model = module.Model(config)
+    for layer in model.language_model.model.layers:
+        for name in ("mhc_attn", "mhc_ffn"):
+            router = getattr(layer, name, None)
+            if router is not None:
+                router.weight = 0.1 * mx.random.normal(router.weight.shape)
+    model.eval()
+    return model
+
+
+def test_sensenova_loop_execution_plan_and_distinct_visit_caches(sensenova_loop_case):
+    module, config = sensenova_loop_case
+    assert module.config.execution_plan(config) == (0, 1, 2, 1, 2, 3)
+    resolved, model_type = get_model_and_args(asdict(config))
+    assert resolved is module and model_type == "sensenova_loop"
+    model = _sensenova_loop_model(sensenova_loop_case).language_model
+    assert len(model.model.layers) == 4 and len(model.layers) == 6
+    assert model.layers[1] is model.layers[3]
+    assert model.layers[2] is model.layers[4]
+    cache = model.make_cache()
+    assert [type(c) for c in cache] == [ArraysCache, KVCache] * 3
+    assert len({id(c) for c in cache}) == 6
+    model(mx.array([[1, 2, 3]]), cache=cache)
+    assert cache[1].offset == cache[3].offset == cache[5].offset == 3
+    assert not mx.allclose(cache[1].keys, cache[3].keys).item()
+    assert not mx.allclose(cache[2][1], cache[4][1]).item()
+    assert not any("_execution" in k for k, _ in tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="one per execution visit"):
+        model(mx.array([[1]]), cache=cache[:4])
+    with pytest.raises(ValueError, match="speculative verifier"):
+        model(mx.array([[1]]), cache=cache, speculative_verify=True)
+
+
+def test_sensenova_loop_explicit_layer_types_and_padded_batch(sensenova_loop_case):
+    # Deliberately disagree with the periodic backbone default.
+    sensenova_loop_case[1].text_config.full_attention_interval = 4
+    language = _sensenova_loop_model(sensenova_loop_case).language_model
+    ids = mx.array([[0, 0, 1, 2], [3, 4, 5, 6]])
+    cache = [
+        (
+            ArraysCache(size=2, left_padding=[2, 0])
+            if layer.is_linear
+            else BatchKVCache([2, 0])
+        )
+        for layer in language.layers
+    ]
+    actual = language(ids, cache=cache, mask=ids != 0).logits[:, -1:]
+    next_ids = mx.array([[7], [8]])
+    decoded = language(next_ids, cache=cache).logits
+    for row, pad in enumerate([2, 0]):
+        solo_cache = language.make_cache()
+        expected = language(ids[row : row + 1, pad:], cache=solo_cache).logits[:, -1:]
+        expected_decoded = language(next_ids[row : row + 1], cache=solo_cache).logits
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=3e-5, rtol=3e-5
+        )
+        np.testing.assert_allclose(
+            np.array(decoded[row : row + 1]),
+            np.array(expected_decoded),
+            atol=3e-5,
+            rtol=3e-5,
+        )
+
+
+@pytest.mark.parametrize(
+    "streams,identity", [(2, False), (4, False), (2, True), (4, True)]
+)
+def test_sensenova_loop_router_matches_numpy(streams, identity):
+    language = importlib.import_module("mlx_vlm.models.sensenova_loop.language")
+    settings = dict(
+        streams=streams, iterations=20, fixed_identity=identity, pre_scale=0.7
+    )
+    router = language.MHCRouter(8, settings)
+    rng = np.random.default_rng(9)
+    residual = rng.normal(size=(2, 3, streams, 8)).astype(np.float32)
+    weight = rng.normal(scale=0.3, size=router.weight.shape).astype(np.float32)
+    bias = rng.normal(scale=0.4, size=router.bias.shape).astype(np.float32)
+    router.weight, router.bias = mx.array(weight), mx.array(bias)
+    flat = residual.reshape(2, 3, -1)
+    flat = flat / np.sqrt((flat**2).mean(-1, keepdims=True) + 1e-6)
+    logits = flat @ weight.T + bias
+    pre = 1 / (1 + np.exp(-logits[..., :streams]))
+    post = 2 / (1 + np.exp(-logits[..., streams : 2 * streams]))
+    if identity:
+        mix = np.broadcast_to(np.eye(streams), (2, 3, streams, streams))
+    else:
+        log_mix = logits[..., 2 * streams :].reshape(2, 3, streams, streams)
+        for _ in range(20):
+            log_mix -= np.logaddexp.reduce(log_mix, axis=-1, keepdims=True)
+            log_mix -= np.logaddexp.reduce(log_mix, axis=-2, keepdims=True)
+        mix = np.exp(log_mix)
+    branch = (pre[..., None, :] @ residual).squeeze(-2) * 0.7
+    actual_branch, actual_post, actual_mix = router(mx.array(residual))
+    for actual, expected in (
+        (actual_branch, branch),
+        (actual_post, post),
+        (actual_mix, mix),
+    ):
+        np.testing.assert_allclose(np.array(actual), expected, atol=2e-6, rtol=2e-6)
+    merged = router.merge(mx.array(residual), actual_branch, actual_post, actual_mix)
+    expected = mix @ residual + post[..., None] * branch[..., None, :]
+    np.testing.assert_allclose(np.array(merged), expected, atol=3e-6, rtol=3e-6)
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+@pytest.mark.parametrize("chunks", [(1, 2, 1, 2), (3, 3)])
+def test_sensenova_loop_chunked_and_decode_match_full(
+    sensenova_loop_case, with_image, chunks
+):
+    model = _sensenova_loop_model(sensenova_loop_case)
+    ids = (
+        mx.array([[1, 30, 29, 31, 2, 3]])
+        if with_image
+        else mx.array([[1, 2, 3, 4, 5, 6]])
+    )
+    media = {}
+    if with_image:
+        media = dict(
+            pixel_values=mx.random.normal((4, 1176)),
+            image_grid_thw=mx.array([[1, 2, 2]]),
+        )
+    features = model.get_input_embeddings(ids, **media).to_dict()
+    embeds = features.pop("inputs_embeds")
+    language = model.language_model
+    expected = language(
+        ids, inputs_embeds=embeds, cache=language.make_cache(), **features
+    ).logits
+    cache = language.make_cache()
+    start, outputs = 0, []
+    for length in chunks:
+        end = start + length
+        outputs.append(
+            language(
+                ids[:, start:end],
+                inputs_embeds=embeds[:, start:end],
+                cache=cache,
+                **features,
+            ).logits
+        )
+        start = end
+    actual = mx.concatenate(outputs, axis=1)
+    np.testing.assert_allclose(
+        np.array(actual), np.array(expected), atol=3e-5, rtol=3e-5
+    )
+    token = mx.array([[7]])
+    decoded = language(token, cache=cache, rope_deltas=features["rope_deltas"]).logits
+    extended_ids = mx.concatenate([ids, token], axis=1)
+    extended = model(extended_ids, cache=language.make_cache(), **media).logits[:, -1:]
+    np.testing.assert_allclose(
+        np.array(decoded), np.array(extended), atol=3e-5, rtol=3e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "section,changes",
+    [
+        pytest.param("loop_settings", None, id="missing-loop"),
+        pytest.param(
+            "loop_settings", {"eval_count": 0, "counts": [0]}, id="zero-passes"
+        ),
+        pytest.param("loop_settings", {"counts": [1, 2]}, id="variable-passes"),
+        pytest.param("mhc", {"start": 0}, id="crossing-phase"),
+        pytest.param("mhc", {"streams": 3}, id="invalid-streams"),
+        pytest.param("mhc", {"iterations": 0}, id="zero-iterations"),
+    ],
+)
+def test_sensenova_loop_invalid_execution_config(sensenova_loop_case, section, changes):
+    module, config = sensenova_loop_case
+    if changes is None:
+        setattr(config, section, None)
+    else:
+        getattr(config, section).update(changes)
+    with pytest.raises(ValueError):
+        module.Model(config)
+
+
+def test_sensenova_loop_sanitize_is_idempotent_and_keeps_router_values(
+    sensenova_loop_case,
+):
+    model = _sensenova_loop_model(sensenova_loop_case)
+    norm = mx.arange(16, dtype=mx.float32) / 100
+    expected_norm = np.array(norm) + 1
+    router = mx.arange(8 * 32, dtype=mx.float32).reshape(8, 32) / 257
+    weights = {
+        "model.language_model.loop_gate.logits": mx.zeros((1,)),
+        "model.language_model.layers.1.input_layernorm.weight": norm,
+        "model.language_model.layers.1.mhc_attn.weight": router,
+        "model.language_model.layers.0.linear_attn.conv1d.weight": mx.arange(
+            3 * 144
+        ).reshape(144, 1, 3),
+        "model.visual.patch_embed.proj.weight": mx.arange(16 * 3 * 2 * 14 * 14).reshape(
+            16, 3, 2, 14, 14
+        ),
+    }
+    once = model.sanitize(weights)
+    assert not any("loop_gate" in key for key in once)
+    twice = model.sanitize(once)
+    for key in once:
+        assert mx.array_equal(once[key], twice[key]).item()
+    np.testing.assert_allclose(
+        np.array(once["language_model.model.layers.1.input_layernorm.weight"]),
+        expected_norm,
+    )
+    assert mx.array_equal(
+        once["language_model.model.layers.1.mhc_attn.weight"], router
+    ).item()
+
+
+def test_sensenova_loop_quantized_checkpoint_round_trip_preserves_routing(
+    sensenova_loop_case, tmp_path
+):
+    from mlx_vlm.quant_utils import quantize_model
+
+    _, config = sensenova_loop_case
+    config.text_config.hidden_size = config.text_config.vocab_size = 64
+    config.text_config.intermediate_size = 128
+    config.vision_config.out_hidden_size = 64
+    model = _sensenova_loop_model(sensenova_loop_case)
+    original_router = model.language_model.model.layers[1].mhc_attn.weight
+    model.update(
+        tree_map_with_path(
+            lambda p, v: v.astype(mx.bfloat16) if model.cast_predicate(p) else v,
+            model.parameters(),
+        )
+    )
+    model, converted = quantize_model(
+        model,
+        {key: value for key, value in asdict(config).items() if value is not None},
+        32,
+        4,
+        quant_predicate=model.quant_predicate,
+    )
+    router = model.language_model.model.layers[1].mhc_attn
+    assert router.weight.dtype == mx.float32
+    assert mx.array_equal(router.weight, original_router).item()
+    ids = mx.array([[1, 2, 3]])
+    expected = model(ids).logits
+    save_weights(tmp_path, model)
+    (tmp_path / "config.json").write_text(json.dumps(converted))
+    restored = load_model(tmp_path)
+    actual = restored(ids).logits
+    assert len(restored.language_model.make_cache()) == 6
+    assert restored.language_model.model.layers[1].mhc_attn.weight.dtype == mx.float32
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
 
 
 @pytest.fixture
