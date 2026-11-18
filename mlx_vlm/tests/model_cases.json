@@ -1719,6 +1719,18 @@
     {
       "id": "qwen3_5",
       "module": "qwen3_5",
+      "regression": {
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize", "quantized_roundtrip"],
+        "config": {"image_token_id": 29, "video_token_id": 28, "vision_start_token_id": 30, "vision_end_token_id": 31},
+        "execution_plan": [0, 1],
+        "cache_types": ["ArraysCache", "KVCache"],
+        "fp32_parameters": ["*.A_log"],
+        "discarded_weights": ["model.language_model.mtp.weight"]
+      },
+      "invalid_configs": [
+        {"id": "incomplete-rope", "config": {"text_config": {"rope_parameters": {"type": "default"}}}},
+        {"id": "unsupported-deepstack", "config": {"vision_config": {"deepstack_visual_indexes": [0]}}}
+      ],
       "config": {
         "text_config": {
           "model_type": "qwen3_5",
@@ -1766,6 +1778,22 @@
     {
       "id": "sensenova_loop",
       "module": "sensenova_loop",
+      "regression": {
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize", "quantized_roundtrip"],
+        "config": {"text_config": {"full_attention_interval": 4}},
+        "execution_plan": [0, 1, 2, 1, 2, 3],
+        "cache_types": ["ArraysCache", "KVCache", "ArraysCache", "KVCache", "ArraysCache", "KVCache"],
+        "fp32_parameters": ["*.mhc_attn.*", "*.mhc_ffn.*"],
+        "discarded_weights": ["model.language_model.loop_gate.logits"]
+      },
+      "invalid_configs": [
+        {"id": "missing-loop", "config": {"loop_settings": null}},
+        {"id": "zero-passes", "config": {"loop_settings": {"eval_count": 0, "counts": [0]}}},
+        {"id": "variable-passes", "config": {"loop_settings": {"counts": [1, 2]}}},
+        {"id": "crossing-phase", "config": {"mhc": {"start": 0}}},
+        {"id": "invalid-streams", "config": {"mhc": {"streams": 3}}},
+        {"id": "zero-iterations", "config": {"mhc": {"iterations": 0}}}
+      ],
       "config": {
         "text_config": {
           "model_type": "qwen3_5_text",
