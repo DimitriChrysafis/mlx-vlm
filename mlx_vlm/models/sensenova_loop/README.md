@@ -64,5 +64,4 @@ is explicitly rejected because it bypasses mHC routing. Long-context behavior
 at the checkpoint's full 512K limit has not been validated.
 
 The routing and execution-plan implementation is adapted from the
-[Apache-2.0 reference code](https://huggingface.co/sensenova/SenseNova-Loop-9B/blob/329a65f701ba8c48b73c30d0cbaa6f0449733673/modeling_sensenova_loop.py);
-see [LICENSE](LICENSE).
+[Apache-2.0 reference code](https://huggingface.co/sensenova/SenseNova-Loop-9B/blob/329a65f701ba8c48b73c30d0cbaa6f0449733673/modeling_sensenova_loop.py).
