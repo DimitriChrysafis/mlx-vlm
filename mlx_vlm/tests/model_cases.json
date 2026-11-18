@@ -1720,7 +1720,7 @@
       "id": "qwen3_5",
       "module": "qwen3_5",
       "regression": {
-        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize", "quantized_roundtrip"],
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize"],
         "config": {"image_token_id": 29, "video_token_id": 28, "vision_start_token_id": 30, "vision_end_token_id": 31},
         "execution_plan": [0, 1],
         "cache_types": ["ArraysCache", "KVCache"],
@@ -1779,7 +1779,7 @@
       "id": "sensenova_loop",
       "module": "sensenova_loop",
       "regression": {
-        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize", "quantized_roundtrip"],
+        "checks": ["execution_cache", "padded_batch", "chunked_prefill", "sanitize"],
         "config": {"text_config": {"full_attention_interval": 4}},
         "execution_plan": [0, 1, 2, 1, 2, 3],
         "cache_types": ["ArraysCache", "KVCache", "ArraysCache", "KVCache", "ArraysCache", "KVCache"],

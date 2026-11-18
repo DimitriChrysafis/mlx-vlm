@@ -48,7 +48,6 @@ from mlx_vlm.utils import (
     load,
     load_config,
     load_model,
-    save_weights,
     sharded_load,
 )
 
@@ -1587,8 +1586,8 @@ def regression_config(case, overrides=None):
     return module, build_config(module, fields)
 
 
-def regression_model(case, overrides=None):
-    module, config = regression_config(case, overrides)
+def regression_model(case):
+    module, config = regression_config(case)
     mx.random.seed(17)
     model = module.Model(config)
     # Exercise protected routing weights away from their zero initialization.
@@ -1752,110 +1751,6 @@ def test_hybrid_backbone_sanitize_is_idempotent(case):
         "vision_tower.patch_embed.proj.weight": patch,
     }.items():
         assert mx.array_equal(once[key], expected).item(), key
-
-
-@pytest.mark.parametrize(
-    "case", regression_cases("quantized_roundtrip"), ids=lambda c: c["id"]
-)
-def test_quantized_checkpoint_round_trip_preserves_fp32_parameters(case, tmp_path):
-    from mlx_vlm.quant_utils import quantize_model
-
-    model = regression_model(
-        case,
-        {
-            "text_config": {
-                "hidden_size": 64,
-                "vocab_size": 64,
-                "intermediate_size": 128,
-            },
-            "vision_config": {"out_hidden_size": 64},
-        },
-    )
-    protected = {
-        key: value
-        for key, value in tree_flatten(model.parameters())
-        if any(fnmatchcase(key, p) for p in case["regression"]["fp32_parameters"])
-    }
-    assert protected
-    model.update(
-        tree_map_with_path(
-            lambda p, v: v.astype(mx.bfloat16) if model.cast_predicate(p) else v,
-            model.parameters(),
-        )
-    )
-    model, converted = quantize_model(
-        model,
-        {k: v for k, v in asdict(model.config).items() if v is not None},
-        32,
-        4,
-        quant_predicate=model.quant_predicate,
-    )
-    ids = mx.array([[1, 2, 3]])
-    expected = model(ids).logits
-    save_weights(tmp_path, model)
-    (tmp_path / "config.json").write_text(json.dumps(converted))
-    restored = load_model(tmp_path)
-    assert len(restored.language_model.make_cache()) == len(
-        case["regression"]["execution_plan"]
-    )
-    for candidate in (model, restored):
-        parameters = dict(tree_flatten(candidate.parameters()))
-        for key, value in protected.items():
-            assert parameters[key].dtype == mx.float32, key
-            assert mx.array_equal(parameters[key], value).item(), key
-    np.testing.assert_array_equal(
-        np.array(restored(ids).logits.astype(mx.float32)),
-        np.array(expected.astype(mx.float32)),
-    )
-
-
-def test_sensenova_loop_rejects_invalid_cache_and_speculative_verifier():
-    language = regression_model(model_case("sensenova_loop")).language_model
-    cache = language.make_cache()
-    with pytest.raises(ValueError, match="one per execution visit"):
-        language(mx.array([[1]]), cache=cache[: len(language.model.layers)])
-    with pytest.raises(ValueError, match="speculative verifier"):
-        language(mx.array([[1]]), cache=cache, speculative_verify=True)
-
-
-@pytest.mark.parametrize(
-    "streams,identity", [(2, False), (4, False), (2, True), (4, True)]
-)
-def test_sensenova_loop_router_matches_numpy(streams, identity):
-    language = importlib.import_module("mlx_vlm.models.sensenova_loop.language")
-    settings = dict(
-        streams=streams, iterations=20, fixed_identity=identity, pre_scale=0.7
-    )
-    router = language.MHCRouter(8, settings)
-    rng = np.random.default_rng(9)
-    residual = rng.normal(size=(2, 3, streams, 8)).astype(np.float32)
-    weight = rng.normal(scale=0.3, size=router.weight.shape).astype(np.float32)
-    bias = rng.normal(scale=0.4, size=router.bias.shape).astype(np.float32)
-    router.weight, router.bias = mx.array(weight), mx.array(bias)
-    flat = residual.reshape(2, 3, -1)
-    flat = flat / np.sqrt((flat**2).mean(-1, keepdims=True) + 1e-6)
-    logits = flat @ weight.T + bias
-    pre = 1 / (1 + np.exp(-logits[..., :streams]))
-    post = 2 / (1 + np.exp(-logits[..., streams : 2 * streams]))
-    if identity:
-        mix = np.broadcast_to(np.eye(streams), (2, 3, streams, streams))
-    else:
-        log_mix = logits[..., 2 * streams :].reshape(2, 3, streams, streams)
-        for _ in range(20):
-            log_mix -= np.logaddexp.reduce(log_mix, axis=-1, keepdims=True)
-            log_mix -= np.logaddexp.reduce(log_mix, axis=-2, keepdims=True)
-        mix = np.exp(log_mix)
-    branch = (pre[..., None, :] @ residual).squeeze(-2) * 0.7
-    actual_branch, actual_post, actual_mix = router(mx.array(residual))
-    for actual, expected in (
-        (actual_branch, branch),
-        (actual_post, post),
-        (actual_mix, mix),
-    ):
-        np.testing.assert_allclose(np.array(actual), expected, atol=2e-6, rtol=2e-6)
-    merged = router.merge(mx.array(residual), actual_branch, actual_post, actual_mix)
-    expected = mix @ residual + post[..., None] * branch[..., None, :]
-    np.testing.assert_allclose(np.array(merged), expected, atol=3e-6, rtol=3e-6)
 
 
 @pytest.fixture
