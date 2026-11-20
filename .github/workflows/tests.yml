@@ -143,7 +143,6 @@ jobs:
               tests/test_position_embedding_resize.py
               tests/test_processors.py
               tests/test_speculative.py
-              tests/test_wemm_video.py
           - group: media
             suite: Diffusion, audio, images, video & extraction
             os: macos-15
