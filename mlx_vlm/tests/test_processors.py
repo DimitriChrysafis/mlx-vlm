@@ -3061,6 +3061,10 @@ def test_parser_selection(name):
 @pytest.mark.parametrize("thinking", [False, True])
 @pytest.mark.parametrize("with_system", [False, True])
 def test_deepseek_vision_tools_round_trip(thinking, with_system):
+    from mlx_vlm.utils import get_model_and_args
+
+    module, _ = get_model_and_args({"model_type": "deepseek_v4"})
+    assert module.NATIVE_CHAT_CAPABILITIES == {"tools", "reasoning"}
     processor = c.deepseek(fast_tokenizer())
     messages = [
         dict(
