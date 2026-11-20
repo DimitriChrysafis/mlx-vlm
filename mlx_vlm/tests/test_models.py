@@ -1437,7 +1437,11 @@ def build_config(module, values, config_type="ModelConfig"):
     fields = copy.deepcopy(values)
     if (
         module.__name__
-        in ("mlx_vlm.models.minicpmv4_7", "mlx_vlm.models.nemotron_h_nano_omni")
+        in (
+            "mlx_vlm.models.minicpmv4_7",
+            "mlx_vlm.models.nemotron_h_nano_omni",
+            "mlx_vlm.models.wemm_video",
+        )
         and config_type == "ModelConfig"
     ):
         # Preserve checkpoint aliases and per-layer text-config dispatch.
