@@ -1108,46 +1108,14 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-    config_path = Path(model_path) / "config.json"
-    if (
-        not config_path.is_file()
-        and not Path(model_path).is_absolute()
-        and "/" in str(model_path)
-    ):
-        from huggingface_hub import hf_hub_download
-
-        config_path = Path(
-            hf_hub_download(
-                str(model_path),
-                "config.json",
-                **{
-                    key: kwargs[key]
-                    for key in (
-                        "revision",
-                        "cache_dir",
-                        "token",
-                        "local_files_only",
-                        "force_download",
-                    )
-                    if key in kwargs
-                },
-            )
-        )
-    config = json.loads(config_path.read_text()) if config_path.is_file() else {}
-    if get_model_type(config) == "wemm_video":
-        from .models.wemm_video.processing_wemm_video import WeMMVideoProcessor
-
-        processor = WeMMVideoProcessor.from_pretrained(model_path, **kwargs)
-        model_path = config_path.parent
-    else:
-        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
-        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
-
-        # Get the tokenizer object
-        tokenizer_obj = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
+        tokenizer_obj = getattr(processor, "tokenizer", processor)
+        tokenizer_path = Path(model_path)
+        resolved_path = getattr(tokenizer_obj, "name_or_path", None)
+        if not tokenizer_path.is_dir() and isinstance(resolved_path, (str, Path)):
+            tokenizer_path = Path(resolved_path) if resolved_path else tokenizer_path
+        detokenizer_class = load_tokenizer(tokenizer_path, return_tokenizer=False)
 
         # Non-text models (depth, detection) have no decode(); skip detokenizer
         try:

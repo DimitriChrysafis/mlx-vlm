@@ -855,14 +855,30 @@ def test_auto_processor_routes_to_custom_loader(
 
 @pytest.mark.parametrize("name,case", DATA["native_qwen_checkpoints"].items())
 @pytest.mark.parametrize("remote", [False, True], ids=["local", "hub"])
-def test_native_processor_dispatch(tmp_path, monkeypatch, name, case, remote):
+@pytest.mark.parametrize(
+    "trust", [None, False, True], ids=["default", "native", "trusted"]
+)
+def test_native_processor_dispatch(tmp_path, name, case, remote, trust):
     _write_configs(tmp_path, config=case["config"])
     processor = _native_qwen_processor(case["processor"])
-    monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
-        lambda *a, **kw: str(tmp_path / "config.json"),
+    processor.tokenizer.name_or_path = str(tmp_path)
+    hub_options = dict(
+        revision="pinned-revision",
+        cache_dir=str(tmp_path / "cache"),
+        token="test-token",
+        local_files_only=True,
+        force_download=False,
+        subfolder="processor",
     )
+    options = {
+        **hub_options,
+        **({"trust_remote_code": trust} if trust is not None else {}),
+    }
     with (
+        patch(
+            "transformers.utils.hub.cached_file",
+            return_value=str(tmp_path / "config.json"),
+        ) as metadata,
         patch.object(
             type(processor), "from_pretrained", return_value=processor
         ) as loader,
@@ -870,10 +886,50 @@ def test_native_processor_dispatch(tmp_path, monkeypatch, name, case, remote):
         patch("mlx_vlm.utils.StoppingCriteria"),
     ):
         source = "test/checkpoint" if remote else tmp_path
-        assert load_processor(source, trust_remote_code=False) is processor
-        loader.assert_called_once_with(source, trust_remote_code=False)
-        expected_path = tmp_path if case["processor"] == "wemm_video" else source
-        assert tokenizer.call_args.args == (expected_path,)
+        assert load_processor(source, **options) is processor
+        expected_trust = (
+            trust if trust is not None else case["processor"] != "wemm_video"
+        )
+        loader.assert_called_once_with(
+            source, **hub_options, trust_remote_code=expected_trust
+        )
+        metadata.assert_called_once_with(
+            source,
+            "config.json",
+            **hub_options,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        assert tokenizer.call_args.args == (tmp_path,)
+
+
+@pytest.mark.parametrize("config", [None, {"model_type": "unknown_native_processor"}])
+def test_auto_processor_falls_back_without_native_registration(
+    tmp_path, monkeypatch, config
+):
+    from mlx_vlm.models import base
+
+    if config is not None:
+        _write_configs(tmp_path, config=config)
+    sentinel = object()
+    fallback = Mock(return_value=sentinel)
+    monkeypatch.setattr(base, "_ORIGINAL_AUTO_PROCESSOR", NS(__func__=fallback))
+    assert AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) is sentinel
+    fallback.assert_called_once_with(AutoProcessor, tmp_path, trust_remote_code=False)
+
+
+def test_auto_processor_preserves_native_loader_errors(tmp_path, monkeypatch):
+    from mlx_vlm.models import base
+
+    _write_configs(tmp_path, config={"model_type": "test_native_processor"})
+    native = NS(from_pretrained=Mock(side_effect=ValueError("invalid native config")))
+    monkeypatch.setitem(
+        base._NATIVE_PROCESSORS, "test_native_processor", (native, False)
+    )
+    fallback = Mock()
+    monkeypatch.setattr(base, "_ORIGINAL_AUTO_PROCESSOR", NS(__func__=fallback))
+    with pytest.raises(ValueError, match="invalid native config"):
+        AutoProcessor.from_pretrained(tmp_path)
+    fallback.assert_not_called()
 
 
 @pytest.mark.parametrize("name,case", DATA["native_qwen_checkpoints"].items())
@@ -898,6 +954,36 @@ def test_native_processor_roundtrip_without_remote_code(
     assert expected.keys() == actual.keys()
     for key in expected:
         equal(expected[key], actual[key])
+
+    # No model import precedes load_processor in this fresh interpreter.
+    script = textwrap.dedent("""
+        import json, sys
+        from pathlib import Path
+        from PIL import Image
+        from mlx_vlm.utils import load_processor
+        folder = Path(sys.argv[1])
+        processor = load_processor(folder, add_detokenizer=False, local_files_only=True)
+        assert type(processor).__name__ == sys.argv[3]
+        outputs = processor(text=sys.argv[2], images=[Image.new("RGB", (4, 4))], return_tensors="np")
+        (folder / "fresh-output.json").write_text(json.dumps({k: v.tolist() for k, v in outputs.items()}))
+    """)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            inputs["text"],
+            type(processor).__name__,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    fresh = json.loads((tmp_path / "fresh-output.json").read_text())
+    assert fresh.keys() == expected.keys()
+    for key in expected:
+        equal(expected[key], fresh[key])
 
 
 def test_mistral_large4_processor_without_torch(tmp_path):
