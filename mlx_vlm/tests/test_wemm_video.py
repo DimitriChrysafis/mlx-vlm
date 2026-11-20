@@ -18,7 +18,7 @@ from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
     Qwen3VLImageProcessor,
     Qwen3VLVideoProcessor,
 )
-from mlx_vlm.models.wemm_video import AudioConfig, Model, ModelConfig
+from mlx_vlm.models.wemm_video import AudioConfig, Model, ModelConfig, VisionModel
 from mlx_vlm.models.wemm_video.audio import AudioEncoder, sanitize_audio_weights
 from mlx_vlm.models.wemm_video.processing_wemm_video import (
     PLACEHOLDERS,
@@ -26,7 +26,12 @@ from mlx_vlm.models.wemm_video.processing_wemm_video import (
     audio_timestamp_groups,
     video_token_ids,
 )
-from mlx_vlm.utils import get_model_type, load_processor, prepare_inputs
+from mlx_vlm.utils import (
+    get_model_type,
+    load_processor,
+    prepare_inputs,
+    sanitize_weights,
+)
 
 
 def small_config(moe=False):
@@ -112,19 +117,39 @@ def test_audio_matches_tencent_reference():
 def test_dense_and_moe_forward_and_sanitize(moe):
     model = Model(small_config(moe))
     assert model(mx.array([[1, 2, 3]])).logits.shape == (1, 3, 32)
+    patch_shape = model.vision_tower.patch_embed.proj.weight.shape
+    patch = mx.arange(int(np.prod(patch_shape)), dtype=mx.float32).reshape(
+        patch_shape[0], patch_shape[-1], *patch_shape[1:-1]
+    )
     original = {
-        "model.audio.conv1.weight": mx.zeros((8, 4, 3)),
+        "model.audio.conv1.weight": mx.arange(96, dtype=mx.float32).reshape(8, 4, 3),
         "model.audio.qformer.bert.embeddings.LayerNorm.gamma": mx.ones((12,)),
         "model.audio.qformer.bert.embeddings.LayerNorm.beta": mx.zeros((12,)),
         "model.audio.qformer.bert.embeddings.position_ids": mx.arange(8)[None],
         "model.language_model.norm.weight": mx.zeros((16,)),
+        "model.visual.patch_embed.proj.weight": patch,
     }
-    converted = model.sanitize(original)
+
+    def sanitize(weights):
+        # load_model applies both the model and exported vision sanitizers.
+        weights = sanitize_weights(model, weights)
+        return sanitize_weights(VisionModel, weights, model.config.vision_config)
+
+    converted = sanitize(original)
     assert converted["audio_tower.conv1.weight"].shape == (8, 3, 4)
+    np.testing.assert_array_equal(
+        np.asarray(converted["audio_tower.conv1.weight"]),
+        np.asarray(original["model.audio.conv1.weight"].transpose(0, 2, 1)),
+    )
+    assert converted["vision_tower.patch_embed.proj.weight"].shape == patch_shape
+    np.testing.assert_array_equal(
+        np.asarray(converted["vision_tower.patch_embed.proj.weight"]),
+        np.asarray(patch.transpose(0, 2, 3, 4, 1)),
+    )
     assert mx.all(converted["audio_tower.qformer.norm.weight"] == 1)
     assert mx.all(converted["language_model.model.norm.weight"] == 1)
-    assert len(converted) == 4
-    again = model.sanitize(converted)
+    assert len(converted) == 5
+    again = sanitize(converted)
     for key in converted:
         np.testing.assert_array_equal(
             np.asarray(converted[key]), np.asarray(again[key])
@@ -212,6 +237,40 @@ def processor():
         chat_template=tokenizer.chat_template,
         audio_config={"num_mel_bins": 4},
     )
+
+
+def test_processor_roundtrip_loads_moe_without_remote_code(
+    processor, tmp_path, monkeypatch
+):
+    processor.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "wemm_qwen3_5_moe",
+                "architectures": ["WeMMVideoForConditionalGeneration"],
+                "audio_config": {"num_mel_bins": 4},
+                "auto_map": {"AutoConfig": "configuration_wemm.WeMMConfig"},
+            }
+        )
+    )
+    prompts = []
+
+    def decline_remote_code(prompt):
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", decline_remote_code)
+    restored = load_processor(tmp_path, add_detokenizer=False)
+    assert not prompts
+    inputs = dict(
+        question="Describe this picture.",
+        images=[Image.new("RGB", (4, 4))],
+        return_tensors="np",
+    )
+    expected, actual = processor(**inputs), restored(**inputs)
+    assert expected.keys() == actual.keys()
+    for key in expected:
+        np.testing.assert_array_equal(expected[key], actual[key])
 
 
 @pytest.mark.parametrize(

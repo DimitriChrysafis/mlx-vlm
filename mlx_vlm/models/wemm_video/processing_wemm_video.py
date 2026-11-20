@@ -157,6 +157,9 @@ class WeMMVideoProcessor(Qwen3VLProcessor):
                     if key in kwargs
                 },
             )
+        # The MoE checkpoint advertises a custom config, but its tokenizer is
+        # native. Avoid AutoTokenizer prompting to execute that config's code.
+        kwargs.setdefault("trust_remote_code", False)
         native = Qwen3VLProcessor.from_pretrained(path, **kwargs)
         config = _load_qwen_vl_json(path, "config.json")
         proc_config = _load_qwen_vl_json(path, "processor_config.json") or {}
